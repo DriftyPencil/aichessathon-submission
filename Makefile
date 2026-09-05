@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: setup play arena zip gate
+.PHONY: setup play arena train zip gate
 
 setup:
 	uv sync
@@ -10,6 +10,9 @@ play:
 
 arena:
 	uv run python -m harness.arena --opponent baselines/greedy --games 20
+
+train:
+	uv run python -m training.train
 
 zip:
 	uv run python -m harness.package
