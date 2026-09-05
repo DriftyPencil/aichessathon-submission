@@ -36,6 +36,65 @@ _KNIGHT_DIRECTIONS = (
 _UNDERPROMOTIONS = (chess.KNIGHT, chess.BISHOP, chess.ROOK)
 
 
+def mirror_state(state: np.ndarray) -> np.ndarray:
+    """Reflect a canonical board across the vertical file axis."""
+    mirrored = state[:, :, ::-1].copy()
+    mirrored[12] = state[13, :, ::-1]
+    mirrored[13] = state[12, :, ::-1]
+    mirrored[14] = state[15, :, ::-1]
+    mirrored[15] = state[14, :, ::-1]
+    return mirrored
+
+
+def mirror_policy(policy: np.ndarray) -> np.ndarray:
+    """Reflect an 8 x 8 x 73 policy tensor across the vertical file axis."""
+    original = policy.reshape(64, POLICY_PLANES)
+    mirrored = np.zeros_like(original)
+    for source_square in range(64):
+        rank, file_index = divmod(source_square, 8)
+        target_square = rank * 8 + 7 - file_index
+        for direction_index, (file_delta, rank_delta) in enumerate(_QUEEN_DIRECTIONS):
+            mirrored_direction = _QUEEN_DIRECTIONS.index((-file_delta, rank_delta))
+            source_start = direction_index * 7
+            target_start = mirrored_direction * 7
+            mirrored[target_square, target_start : target_start + 7] = original[
+                source_square, source_start : source_start + 7
+            ]
+        for direction_index, (file_delta, rank_delta) in enumerate(_KNIGHT_DIRECTIONS):
+            mirrored_direction = _KNIGHT_DIRECTIONS.index((-file_delta, rank_delta))
+            mirrored[target_square, 56 + mirrored_direction] = original[
+                source_square, 56 + direction_index
+            ]
+        for promotion_direction in range(3):
+            target_start = 64 + (2 - promotion_direction) * 3
+            source_start = 64 + promotion_direction * 3
+            mirrored[target_square, target_start : target_start + 3] = original[
+                source_square, source_start : source_start + 3
+            ]
+    return mirrored.reshape(policy.shape)
+
+
+def mirror_action_index(index: int) -> int:
+    """Reflect one encoded policy action across the vertical file axis."""
+    source_square, plane = divmod(index, POLICY_PLANES)
+    rank, file_index = divmod(source_square, 8)
+    target_square = rank * 8 + 7 - file_index
+    if plane < 56:
+        direction_index, distance = divmod(plane, 7)
+        file_delta, rank_delta = _QUEEN_DIRECTIONS[direction_index]
+        mirrored_direction = _QUEEN_DIRECTIONS.index((-file_delta, rank_delta))
+        target_plane = mirrored_direction * 7 + distance
+    elif plane < 64:
+        direction_index = plane - 56
+        file_delta, rank_delta = _KNIGHT_DIRECTIONS[direction_index]
+        mirrored_direction = _KNIGHT_DIRECTIONS.index((-file_delta, rank_delta))
+        target_plane = 56 + mirrored_direction
+    else:
+        promotion_direction, promotion = divmod(plane - 64, 3)
+        target_plane = 64 + (2 - promotion_direction) * 3 + promotion
+    return target_square * POLICY_PLANES + target_plane
+
+
 def _oriented_square(square: chess.Square, turn: chess.Color) -> chess.Square:
     return square if turn == chess.WHITE else chess.square_mirror(square)
 
