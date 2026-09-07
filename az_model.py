@@ -48,30 +48,7 @@ def mirror_state(state: np.ndarray) -> np.ndarray:
 
 def mirror_policy(policy: np.ndarray) -> np.ndarray:
     """Reflect an 8 x 8 x 73 policy tensor across the vertical file axis."""
-    original = policy.reshape(64, POLICY_PLANES)
-    mirrored = np.zeros_like(original)
-    for source_square in range(64):
-        rank, file_index = divmod(source_square, 8)
-        target_square = rank * 8 + 7 - file_index
-        for direction_index, (file_delta, rank_delta) in enumerate(_QUEEN_DIRECTIONS):
-            mirrored_direction = _QUEEN_DIRECTIONS.index((-file_delta, rank_delta))
-            source_start = direction_index * 7
-            target_start = mirrored_direction * 7
-            mirrored[target_square, target_start : target_start + 7] = original[
-                source_square, source_start : source_start + 7
-            ]
-        for direction_index, (file_delta, rank_delta) in enumerate(_KNIGHT_DIRECTIONS):
-            mirrored_direction = _KNIGHT_DIRECTIONS.index((-file_delta, rank_delta))
-            mirrored[target_square, 56 + mirrored_direction] = original[
-                source_square, 56 + direction_index
-            ]
-        for promotion_direction in range(3):
-            target_start = 64 + (2 - promotion_direction) * 3
-            source_start = 64 + promotion_direction * 3
-            mirrored[target_square, target_start : target_start + 3] = original[
-                source_square, source_start : source_start + 3
-            ]
-    return mirrored.reshape(policy.shape)
+    return policy.reshape(-1)[MIRROR_ACTION_INDICES].reshape(policy.shape)
 
 
 def mirror_action_index(index: int) -> int:
@@ -93,6 +70,11 @@ def mirror_action_index(index: int) -> int:
         promotion_direction, promotion = divmod(plane - 64, 3)
         target_plane = 64 + (2 - promotion_direction) * 3 + promotion
     return target_square * POLICY_PLANES + target_plane
+
+
+MIRROR_ACTION_INDICES = np.asarray(
+    [mirror_action_index(index) for index in range(POLICY_SIZE)], dtype=np.int64
+)
 
 
 def _oriented_square(square: chess.Square, turn: chess.Color) -> chess.Square:
@@ -216,3 +198,12 @@ class AlphaZeroLite(nn.Module):
         value = self.relu(self.value_bn(self.value_conv(features)))
         value = self.relu(self.value_fc1(value.flatten(1)))
         return policy, torch.tanh(self.value_fc2(value)).squeeze(1)
+
+
+def model_from_state(state: dict[str, Tensor]) -> AlphaZeroLite:
+    """Recover the width and depth of a team-trained state dictionary."""
+    channels = state["stem.0.weight"].shape[0]
+    blocks = len({name.split(".")[1] for name in state if name.startswith("tower.")})
+    model = AlphaZeroLite(channels=channels, blocks=blocks)
+    model.load_state_dict(state)
+    return model

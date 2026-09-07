@@ -10,21 +10,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import chess
+import chess.pgn
 import numpy as np
 import torch
 from torch import Tensor, nn
 
 from az_model import (
+    MIRROR_ACTION_INDICES,
     POLICY_SIZE,
     AlphaZeroLite,
     action_index,
     encode_board,
-    mirror_action_index,
     mirror_policy,
     mirror_state,
+    model_from_state,
 )
+from harness.rules import PLY_CAP
 
 PUCT = 1.55
+FPU_REDUCTION = 0.2
 
 
 @dataclass(slots=True)
@@ -33,6 +37,10 @@ class Experience:
     policy: np.ndarray
     value: float
     legal_actions: np.ndarray | None = None
+    value_weight: float = 1.0
+    game_id: int = -1
+    position_key: int | None = None
+    best_action: int | None = None
 
 
 @dataclass(slots=True)
@@ -41,6 +49,7 @@ class TrainingNode:
     visits: int = 0
     value_sum: float = 0.0
     expanded: bool = False
+    proven: float | None = None
     children: dict[chess.Move, TrainingNode] = field(default_factory=dict)
 
     def value(self) -> float:
@@ -58,16 +67,19 @@ class SelfPlayGame:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=Path("weights/az_lite.pt"))
+    parser.add_argument("--out", type=Path, default=Path("training/runs/selfplay/candidate.pt"))
+    parser.add_argument("--initial-weights", type=Path, default=Path("weights/az_lite.pt"))
     parser.add_argument("--device", choices=("auto", "mps", "cuda", "cpu"), default="auto")
     parser.add_argument("--iterations", type=int, default=12)
     parser.add_argument("--games", type=int, default=32)
+    parser.add_argument("--opening-fens", type=Path)
     parser.add_argument("--simulations", type=int, default=96)
     parser.add_argument("--train-epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--replay-size", type=int, default=40_000)
-    parser.add_argument("--max-plies", type=int, default=160)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--max-plies", type=int, default=PLY_CAP)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--value-loss-weight", type=float, default=1.0)
     parser.add_argument("--teacher-dataset", type=Path)
     parser.add_argument("--teacher-mix", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260905)
@@ -120,6 +132,15 @@ def expand_node(
     node.children = {
         move: TrainingNode(prior=float(prior)) for move, prior in zip(moves, priors, strict=True)
     }
+    if add_noise:
+        for move, child in node.children.items():
+            board.push(move)
+            try:
+                if board.is_checkmate():
+                    child.proven = -1.0
+                    node.proven = 1.0
+            finally:
+                board.pop()
     node.expanded = True
 
 
@@ -128,7 +149,10 @@ def select_child(node: TrainingNode) -> tuple[chess.Move, TrainingNode]:
 
     def score(item: tuple[chess.Move, TrainingNode]) -> float:
         child = item[1]
-        return -child.value() + PUCT * child.prior * parent_scale / (1 + child.visits)
+        if child.proven is not None:
+            return 0.0 if child.proven == 0.0 else -math.inf
+        value = -child.value() if child.visits else node.value() - FPU_REDUCTION
+        return value + PUCT * child.prior * parent_scale / (1 + child.visits)
 
     return max(node.children.items(), key=score)
 
@@ -136,6 +160,14 @@ def select_child(node: TrainingNode) -> tuple[chess.Move, TrainingNode]:
 def backpropagate(path: list[TrainingNode], leaf_value: float) -> None:
     value = leaf_value
     for node in reversed(path):
+        if node.proven is None and node.children:
+            proofs = [child.proven for child in node.children.values()]
+            if -1.0 in proofs:
+                node.proven = 1.0
+            elif all(proof is not None for proof in proofs):
+                node.proven = max(-proof for proof in proofs if proof is not None)
+        if node.proven is not None:
+            value = node.proven
         node.visits += 1
         node.value_sum += value
         value = -value
@@ -145,6 +177,18 @@ def terminal_value(board: chess.Board, outcome: chess.Outcome) -> float:
     if outcome.winner is None:
         return 0.0
     return 1.0 if outcome.winner == board.turn else -1.0
+
+
+def search_terminal_value(board: chess.Board) -> float | None:
+    """Return an exact result while avoiding speculative repetition scans on every leaf."""
+    outcome = board.outcome(claim_draw=False)
+    if outcome is not None:
+        return terminal_value(board, outcome)
+    if board.halfmove_clock >= 99 and board.can_claim_fifty_moves():
+        return 0.0
+    if board.is_repetition(2) and board.can_claim_threefold_repetition():
+        return 0.0
+    return None
 
 
 def batched_search(
@@ -165,17 +209,23 @@ def batched_search(
     for _ in range(max(1, simulations)):
         pending: list[tuple[TrainingNode, chess.Board, list[TrainingNode]]] = []
         for root, source in zip(roots, boards, strict=True):
-            board = source.copy(stack=False)
+            if root.proven is not None:
+                continue
+            board = source.copy(stack=True)
             node = root
             path = [root]
-            while node.expanded and node.children:
+            while node.expanded and node.children and node.proven is None:
                 move, node = select_child(node)
                 board.push(move)
                 path.append(node)
 
-            outcome = board.outcome(claim_draw=False)
-            if outcome is not None:
-                backpropagate(path, terminal_value(board, outcome))
+            if node.proven is not None:
+                backpropagate(path, node.proven)
+                continue
+            result = search_terminal_value(board)
+            if result is not None:
+                node.proven = result
+                backpropagate(path, node.proven)
             else:
                 pending.append((node, board, path))
 
@@ -190,6 +240,16 @@ def batched_search(
     policies: list[np.ndarray] = []
     for root, board in zip(roots, boards, strict=True):
         policy = np.zeros(POLICY_SIZE, dtype=np.float32)
+        if root.proven is not None:
+            solved = [
+                move
+                for move, child in root.children.items()
+                if child.proven is not None and -child.proven == root.proven
+            ]
+            for move in solved:
+                policy[action_index(board, move)] = 1.0 / len(solved)
+            policies.append(policy)
+            continue
         total = sum(child.visits for child in root.children.values())
         if total:
             for move, child in root.children.items():
@@ -220,13 +280,19 @@ def legal_action_indices(board: chess.Board) -> np.ndarray:
     return np.asarray([action_index(board, move) for move in board.legal_moves], dtype=np.int64)
 
 
-def finish_game(game: SelfPlayGame, winner: chess.Color | None) -> list[Experience]:
+def finish_game(
+    game: SelfPlayGame,
+    winner: chess.Color | None,
+    *,
+    truncated: bool = False,
+) -> list[Experience]:
     return [
         Experience(
             state,
             policy,
             0.0 if winner is None else (1.0 if winner == turn else -1.0),
             legal_actions,
+            0.0 if truncated else 1.0,
         )
         for state, policy, legal_actions, turn in game.trajectory
     ]
@@ -239,12 +305,23 @@ def self_play(
     max_plies: int,
     device: torch.device,
     rng: np.random.Generator,
+    log_directory: Path | None = None,
+    starting_fens: tuple[str, ...] = (),
 ) -> list[Experience]:
-    active = [SelfPlayGame() for _ in range(game_count)]
+    if starting_fens:
+        active = [
+            SelfPlayGame(board=chess.Board(starting_fens[index % len(starting_fens)]))
+            for index in rng.permutation(game_count)
+        ]
+    else:
+        active = [SelfPlayGame() for _ in range(game_count)]
     examples: list[Experience] = []
     started_at = time.monotonic()
     completed = 0
     reported = 0
+    terminations: dict[str, int] = {}
+    if log_directory is not None:
+        log_directory.mkdir(parents=True, exist_ok=True)
 
     model.eval()
     while active:
@@ -267,11 +344,23 @@ def self_play(
             if outcome is not None:
                 examples.extend(finish_game(game, outcome.winner))
                 completed += 1
-            elif game.plies >= max_plies:
-                examples.extend(finish_game(game, None))
+                termination = outcome.termination.name.lower()
+            elif game.plies >= max_plies or game.board.ply() >= PLY_CAP:
+                truncated = game.board.ply() < PLY_CAP
+                examples.extend(finish_game(game, None, truncated=truncated))
                 completed += 1
+                termination = "truncated" if truncated else "ply_cap"
             else:
                 continuing.append(game)
+                continue
+            terminations[termination] = terminations.get(termination, 0) + 1
+            if log_directory is not None:
+                pgn = chess.pgn.Game.from_board(game.board)
+                pgn.headers["Result"] = outcome.result() if outcome is not None else "*"
+                if termination == "ply_cap":
+                    pgn.headers["Result"] = "1/2-1/2"
+                pgn.headers["Termination"] = termination
+                (log_directory / f"{completed:03d}.pgn").write_text(str(pgn) + "\n")
         active = continuing
         if completed > reported and (completed % 2 == 0 or not active):
             elapsed = time.monotonic() - started_at
@@ -281,6 +370,7 @@ def self_play(
                 flush=True,
             )
             reported = completed
+    print(f"self-play terminations: {terminations}", flush=True)
     return examples
 
 
@@ -293,6 +383,7 @@ def train_epochs(
     batch_size: int,
     rng: np.random.Generator,
     freeze_batchnorm: bool = False,
+    value_loss_weight: float = 1.0,
 ) -> None:
     if not examples:
         return
@@ -314,16 +405,14 @@ def train_epochs(
             legal_actions: list[np.ndarray | None] = []
             for index in selected:
                 example = examples[index]
-                if rng.random() < 0.5:
+                # File reflection is a chess symmetry only after all castling rights are gone.
+                if not example.state[12:16].any() and rng.random() < 0.5:
                     states.append(mirror_state(example.state))
                     policies.append(mirror_policy(example.policy))
                     legal_actions.append(
                         None
                         if example.legal_actions is None
-                        else np.asarray(
-                            [mirror_action_index(action) for action in example.legal_actions],
-                            dtype=np.int64,
-                        )
+                        else MIRROR_ACTION_INDICES[example.legal_actions]
                     )
                 else:
                     states.append(example.state)
@@ -336,22 +425,16 @@ def train_epochs(
             )
 
             policy, value = model(state_batch)
-            policy_losses: list[Tensor] = []
-            for row, actions in enumerate(legal_actions):
-                if actions is None:
-                    policy_losses.append(
-                        -(target_policy[row] * torch.log_softmax(policy[row], dim=0)).sum()
-                    )
-                    continue
-                action_tensor = torch.from_numpy(actions).to(device)
-                legal_logits = policy[row].index_select(0, action_tensor)
-                legal_targets = target_policy[row].index_select(0, action_tensor)
-                policy_losses.append(
-                    -(legal_targets * torch.log_softmax(legal_logits, dim=0)).sum()
-                )
-            policy_loss = torch.stack(policy_losses).mean()
-            value_loss = nn.functional.smooth_l1_loss(value, target_value)
-            loss = policy_loss + value_loss
+            legal_logits = mask_policy_logits(policy, legal_actions)
+            policy_loss = -(target_policy * legal_logits.log_softmax(1)).sum(1).mean()
+            value_weights = torch.tensor(
+                [examples[index].value_weight for index in selected],
+                dtype=torch.float32,
+                device=device,
+            )
+            value_errors = nn.functional.mse_loss(value, target_value, reduction="none")
+            value_loss = (value_errors * value_weights).sum() / value_weights.sum().clamp_min(1)
+            loss = policy_loss + value_loss_weight * value_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -367,11 +450,22 @@ def train_epochs(
         )
 
 
+def mask_policy_logits(policy: Tensor, action_sets: list[np.ndarray | None]) -> Tensor:
+    """Mask whole batches at once to avoid thousands of tiny accelerator operations."""
+    mask = np.ones(tuple(policy.shape), dtype=np.bool_)
+    for row, actions in enumerate(action_sets):
+        if actions is not None:
+            mask[row] = False
+            mask[row, actions] = True
+    return policy.masked_fill(~torch.from_numpy(mask).to(policy.device), -1e9)
+
+
 def load_dataset(source: Path) -> list[Experience]:
     with np.load(source) as archive:
         states = archive["states"].astype(np.float32)
         policies = archive["policies"].astype(np.float32)
         values = archive["values"].astype(np.float32)
+        game_ids = archive["game_ids"] if "game_ids" in archive else np.full(len(states), -1)
         if "legal_actions" in archive and "legal_counts" in archive:
             padded_actions = archive["legal_actions"].astype(np.int64)
             legal_counts = archive["legal_counts"].astype(np.int64)
@@ -381,9 +475,9 @@ def load_dataset(source: Path) -> list[Experience]:
         else:
             action_sets = [None] * len(states)
     return [
-        Experience(state, policy, float(value), legal_actions)
-        for state, policy, value, legal_actions in zip(
-            states, policies, values, action_sets, strict=True
+        Experience(state, policy, float(value), legal_actions, game_id=int(game_id))
+        for state, policy, value, legal_actions, game_id in zip(
+            states, policies, values, action_sets, game_ids, strict=True
         )
     ]
 
@@ -428,20 +522,37 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.set_num_threads(1)
     rng = np.random.default_rng(args.seed)
     device = choose_device(args.device)
     print(f"training on {device} with torch {torch.__version__}", flush=True)
 
-    model = AlphaZeroLite().to(device)
+    starting_fens: tuple[str, ...] = ()
+    if args.opening_fens is not None:
+        starting_fens = tuple(
+            line.strip()
+            for line in args.opening_fens.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        for fen in starting_fens:
+            if chess.Board(fen).outcome(claim_draw=True) is not None:
+                raise ValueError(f"opening is already terminal: {fen}")
+        print(f"loaded {len(starting_fens)} rated opening positions", flush=True)
+
+    model = AlphaZeroLite()
     if args.resume and args.out.exists():
-        model.load_state_dict(torch.load(args.out, map_location=device, weights_only=True))
+        model = model_from_state(torch.load(args.out, map_location="cpu", weights_only=True))
         print(f"resumed {args.out}", flush=True)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=1e-4
-    )
+    elif not args.smoke and args.initial_weights.exists():
+        model = model_from_state(
+            torch.load(args.initial_weights, map_location="cpu", weights_only=True)
+        )
+        print(f"initialized from {args.initial_weights}", flush=True)
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     replay: list[Experience] = []
     teacher_examples: list[Experience] = []
-    if args.teacher_dataset is not None and args.teacher_dataset.exists():
+    if args.teacher_dataset is not None:
         teacher_examples = load_dataset(args.teacher_dataset)
         print(f"loaded {len(teacher_examples)} teacher positions", flush=True)
     if teacher_examples and not 0.0 <= args.teacher_mix <= 0.9:
@@ -449,7 +560,16 @@ def main() -> None:
 
     for iteration in range(1, args.iterations + 1):
         print(f"self-play iteration {iteration}/{args.iterations}", flush=True)
-        generated = self_play(model, args.games, args.simulations, args.max_plies, device, rng)
+        generated = self_play(
+            model,
+            args.games,
+            args.simulations,
+            args.max_plies,
+            device,
+            rng,
+            log_directory=args.out.parent / f"selfplay-{iteration:03d}",
+            starting_fens=starting_fens,
+        )
         replay.extend(generated)
         if len(replay) > args.replay_size:
             replay = replay[-args.replay_size :]
@@ -468,6 +588,7 @@ def main() -> None:
             args.batch_size,
             rng,
             freeze_batchnorm=True,
+            value_loss_weight=args.value_loss_weight,
         )
         save_weights(model, args.out)
 

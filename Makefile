@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 TEACHER_MIX ?= 0.5
 
-.PHONY: setup play arena train distill zip gate
+.PHONY: setup play arena train distill benchmark zip gate
 
 setup:
 	uv sync
@@ -17,6 +17,9 @@ train:
 
 distill:
 	uv run python -m training.distill
+
+benchmark:
+	uv run python -m training.benchmark --output training/runs/baseline-gate
 
 zip:
 	uv run python -m harness.package
