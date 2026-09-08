@@ -64,6 +64,7 @@ def main() -> None:
             root = agent._GAME_ROOT
             print(
                 f"clock={clock:>6} move={move} time={elapsed * 1000:>7.0f}ms "
+                f"visits={root.visits if root else 0} "
                 f"retained_tree={root.size if root else 0} peak={peak_mib():.1f} MiB",
                 flush=True,
             )

@@ -24,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--multipv", type=int, default=4)
     parser.add_argument("--branch", type=int, default=4)
     parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--response-book", action="store_true")
+    parser.add_argument("--opponent-branch", type=int, default=8)
+    parser.add_argument("--guide-book", type=Path)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--hash-mb", type=int, default=512)
     return parser.parse_args()
@@ -65,10 +68,36 @@ def teacher_moves(
     return [move for move, _ in scored]
 
 
+def guided_move(
+    board: chess.Board,
+    keys: np.ndarray,
+    actions: np.ndarray,
+) -> chess.Move | None:
+    if not len(keys):
+        return None
+    key = np.uint64(chess.polyglot.zobrist_hash(board))
+    row = int(np.searchsorted(keys, key))
+    if row >= len(keys) or keys[row] != key:
+        return None
+    target = int(actions[row])
+    return next(
+        (move for move in board.legal_moves if action_index(board, move) == target),
+        None,
+    )
+
+
 def main() -> None:
     args = parse_args()
-    if args.nodes < 1 or args.multipv < 1 or args.branch < 1 or args.depth < 0:
+    if (
+        args.nodes < 1
+        or args.multipv < 1
+        or args.branch < 1
+        or args.depth < 0
+        or args.opponent_branch < 1
+    ):
         raise ValueError("nodes, multipv, branch, and depth have invalid values")
+    if args.guide_book is not None and not args.response_book:
+        raise ValueError("--guide-book requires --response-book")
     fens = tuple(
         line.strip()
         for line in args.opening_fens.read_text().splitlines()
@@ -76,32 +105,66 @@ def main() -> None:
     )
     if not fens:
         raise ValueError("opening file is empty")
-    frontier = list(fens)
+    guide_keys = np.empty(0, dtype=np.uint64)
+    guide_actions = np.empty(0, dtype=np.uint16)
+    if args.guide_book is not None:
+        with np.load(args.guide_book) as archive:
+            guide_keys = archive["keys"].astype(np.uint64)
+            guide_actions = archive["actions"].astype(np.uint16)
+        if len(guide_keys) != len(guide_actions) or (
+            len(guide_keys) > 1 and np.any(guide_keys[1:] <= guide_keys[:-1])
+        ):
+            raise ValueError("guide book keys/actions are malformed")
+    frontier: list[tuple[str, chess.Color | None]] = (
+        [(fen, color) for fen in fens for color in (chess.WHITE, chess.BLACK)]
+        if args.response_book
+        else [(fen, None) for fen in fens]
+    )
     entries: dict[int, int] = {}
+    visited: set[tuple[int, chess.Color | None]] = set()
     engine = chess.engine.SimpleEngine.popen_uci(str(find_engine(args.engine)))
     try:
         engine.configure({"Threads": args.threads, "Hash": args.hash_mb})
         for ply in range(args.depth + 1):
-            next_frontier: list[str] = []
-            seen_frontier: set[int] = set()
-            for number, fen in enumerate(frontier, start=1):
+            next_frontier: list[tuple[str, chess.Color | None]] = []
+            seen_frontier: set[tuple[int, chess.Color | None]] = set()
+            for number, (fen, agent_color) in enumerate(frontier, start=1):
                 board = chess.Board(fen)
                 key = chess.polyglot.zobrist_hash(board)
-                if key in entries:
+                state = key, agent_color
+                if state in visited:
                     continue
-                moves = teacher_moves(engine, board, args.nodes, max(args.multipv, args.branch))
+                visited.add(state)
+                branch = (
+                    1
+                    if agent_color is not None and board.turn == agent_color
+                    else args.opponent_branch
+                    if agent_color is not None
+                    else args.branch
+                )
+                guide = (
+                    guided_move(board, guide_keys, guide_actions)
+                    if agent_color is not None and board.turn == agent_color
+                    else None
+                )
+                moves = (
+                    [guide]
+                    if guide is not None
+                    else teacher_moves(engine, board, args.nodes, max(args.multipv, branch))
+                )
                 if not moves:
                     continue
-                entries[key] = action_index(board, moves[0])
+                entries.setdefault(key, action_index(board, moves[0]))
                 if ply < args.depth:
-                    for move in moves[: args.branch]:
+                    for move in moves[:branch]:
                         child = board.copy(stack=False)
                         child.push(move)
                         if child.outcome(claim_draw=True) is None:
                             child_key = chess.polyglot.zobrist_hash(child)
-                            if child_key not in entries and child_key not in seen_frontier:
-                                seen_frontier.add(child_key)
-                                next_frontier.append(child.fen())
+                            child_state = child_key, agent_color
+                            if child_state not in visited and child_state not in seen_frontier:
+                                seen_frontier.add(child_state)
+                                next_frontier.append((child.fen(), agent_color))
                 if number % 100 == 0 or number == len(frontier):
                     print(
                         f"tree ply {ply}: {number}/{len(frontier)}, "

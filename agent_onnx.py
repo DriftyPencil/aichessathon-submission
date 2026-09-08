@@ -12,28 +12,53 @@ import chess.polyglot
 import numpy as np
 import onnxruntime as ort  # type: ignore[import-untyped]
 
-from chess_encoding import POLICY_SIZE, action_index, encode_board
+from chess_encoding import action_index, encode_board
 
-MAX_SIMULATIONS = 32_768
-SEARCH_BATCH_SIZE = 8
-MAX_TREE_NODES = 750_000
+MAX_SIMULATIONS = 131_072
+SEARCH_BATCH_SIZE = 4
+MAX_TREE_NODES = 200_000
 PUCT = 1.55
 FPU_REDUCTION = 0.2
-EVALUATION_CACHE_BYTES = 768 * 1024 * 1024
-MAX_CACHED_EVALUATIONS = EVALUATION_CACHE_BYTES // (POLICY_SIZE * 4 + 1152)
+POLICY_FLOOR_MIX = 0.03
+ROOT_REPLY_FORCING_MIX = 0.25
+MAX_CACHED_EVALUATIONS = 750_000
 
 
 class SearchNode:
-    __slots__ = ("children", "expanded", "prior", "proven", "size", "value_sum", "visits")
+    __slots__ = (
+        "_children",
+        "_moves",
+        "_priors",
+        "expanded",
+        "forcing_mixed",
+        "prior",
+        "proven",
+        "size",
+        "value_sum",
+        "visits",
+    )
 
     def __init__(self, prior: float = 0.0) -> None:
         self.prior = prior
         self.visits = 0
         self.value_sum = 0.0
-        self.children: dict[chess.Move, SearchNode] = {}
+        self._children: dict[chess.Move, SearchNode] | None = None
+        self._moves: list[chess.Move] | None = None
+        self._priors: np.ndarray | None = None
         self.expanded = False
+        self.forcing_mixed = False
         self.proven: float | None = None
         self.size = 1
+
+    @property
+    def children(self) -> dict[chess.Move, SearchNode]:
+        if self._children is None:
+            self._children = {}
+        return self._children
+
+    @children.setter
+    def children(self, value: dict[chess.Move, SearchNode]) -> None:
+        self._children = value
 
     def value(self) -> float:
         return self.value_sum / self.visits if self.visits else 0.0
@@ -114,7 +139,8 @@ def _move_budget_ms(time_left_ms: int) -> float:
         return max(0.0, min(time_left_ms * 0.03, time_left_ms - 10.0))
     if time_left_ms <= 3_000:
         return min(200.0, max(35.0, time_left_ms * 0.08))
-    return min(5_000.0, max(80.0, time_left_ms / 24.0))
+    desired = min(8_000.0, max(80.0, time_left_ms / 14.0))
+    return min(desired, time_left_ms - 500.0)
 
 
 def _mate_in_one(board: chess.Board, moves: list[chess.Move]) -> chess.Move | None:
@@ -139,12 +165,13 @@ def _book_move(board: chess.Board, moves: list[chess.Move]) -> chess.Move | None
     return next((move for move in moves if action_index(board, move) == target), None)
 
 
-def _terminal_value(board: chess.Board) -> float | None:
-    outcome = board.outcome(claim_draw=False)
-    if outcome is not None:
-        if outcome.winner is None:
-            return 0.0
-        return 1.0 if outcome.winner == board.turn else -1.0
+def _terminal_value(board: chess.Board, moves: list[chess.Move]) -> float | None:
+    if not moves:
+        return -1.0 if board.is_check() else 0.0
+    if board.is_insufficient_material():
+        return 0.0
+    if board.halfmove_clock >= 150 or board.is_fivefold_repetition():
+        return 0.0
     if board.halfmove_clock >= 99 and board.can_claim_fifty_moves():
         return 0.0
     if board.is_repetition(2) and board.can_claim_threefold_repetition():
@@ -164,7 +191,14 @@ def _mcts_move(board: chess.Board, deadline: float) -> chess.Move:
         root = SearchNode()
     _GAME_ROOT = root
     if not root.expanded:
-        _expand_node(root, board)
+        root_moves = list(board.legal_moves)
+        _expand_node(
+            root,
+            root_moves,
+            _evaluate_many([(board, root_moves)])[0],
+            materialize=True,
+        )
+    _prepare_root_tactics(root, board)
     simulations = 0
     search_board = board.copy(stack=True)
     root_stack_size = len(search_board.move_stack)
@@ -174,7 +208,9 @@ def _mcts_move(board: chess.Board, deadline: float) -> chess.Move:
         and simulations < MAX_SIMULATIONS
         and time.perf_counter() < deadline
     ):
-        pending: list[tuple[SearchNode, chess.Board, list[SearchNode]]] = []
+        pending: list[
+            tuple[SearchNode, chess.Board, list[SearchNode], list[chess.Move], int]
+        ] = []
         queued: set[SearchNode] = set()
         try:
             for _ in range(min(SEARCH_BATCH_SIZE, MAX_SIMULATIONS - simulations)):
@@ -182,20 +218,28 @@ def _mcts_move(board: chess.Board, deadline: float) -> chess.Move:
                     break
                 node = root
                 path = [root]
+                added_nodes = 0
                 try:
-                    while node.expanded and node.children and node.proven is None:
-                        move, node = _select_child(node)
+                    while node.expanded and node._moves and node.proven is None:
+                        parent = node
+                        child_count = len(parent._children) if parent._children is not None else 0
+                        move, node = _select_child(parent)
+                        if len(parent.children) > child_count:
+                            added_nodes += 1
                         search_board.push(move)
                         path.append(node)
                     if node in queued:
                         break
+                    leaf_moves = list(search_board.legal_moves)
                     if node.proven is None:
-                        node.proven = _terminal_value(search_board)
+                        node.proven = _terminal_value(search_board, leaf_moves)
                     if node.proven is not None:
-                        _backpropagate(path, node.proven)
+                        _backpropagate(path, node.proven, added_nodes=added_nodes)
                         simulations += 1
                         continue
-                    pending.append((node, search_board.copy(stack=False), path))
+                    pending.append(
+                        (node, search_board.copy(stack=False), path, leaf_moves, added_nodes)
+                    )
                     queued.add(node)
                     for ancestor in path:
                         ancestor.visits += 1
@@ -203,15 +247,18 @@ def _mcts_move(board: chess.Board, deadline: float) -> chess.Move:
                 finally:
                     while len(search_board.move_stack) > root_stack_size:
                         search_board.pop()
-            predictions = _predict_many([item[1] for item in pending])
+            predictions = _evaluate_many([(item[1], item[3]) for item in pending])
         finally:
-            for _, _, path in pending:
+            for _, _, path, _, _ in pending:
                 for ancestor in path:
                     ancestor.visits -= 1
                     ancestor.value_sum -= 1.0
-        for (node, leaf_board, path), prediction in zip(pending, predictions, strict=True):
-            leaf_value = _expand_node(node, leaf_board, prediction)
-            _backpropagate(path, leaf_value, added_nodes=len(node.children))
+        for (node, leaf_board, path, moves, added_nodes), prediction in zip(
+            pending, predictions, strict=True
+        ):
+            forcing_board = leaf_board if len(path) == 2 else None
+            leaf_value = _expand_node(node, moves, prediction, forcing_board)
+            _backpropagate(path, leaf_value, added_nodes=added_nodes)
             simulations += 1
     if not root.children:
         return next(iter(board.legal_moves))
@@ -227,40 +274,103 @@ def _best_move(root: SearchNode) -> chess.Move:
     return max(root.children.items(), key=rank)[0]
 
 
-def _select_child(node: SearchNode) -> tuple[chess.Move, SearchNode]:
-    parent_scale = math.sqrt(max(1, node.visits))
-
-    def score(item: tuple[chess.Move, SearchNode]) -> float:
-        child = item[1]
+def _prepare_root_tactics(root: SearchNode, board: chess.Board) -> None:
+    for move, child in root.children.items():
         if child.proven is not None:
-            return 0.0 if child.proven == 0.0 else -math.inf
-        exploitation = -child.value() if child.visits else node.value() - FPU_REDUCTION
-        exploration = PUCT * child.prior * parent_scale / (1 + child.visits)
-        return exploitation + exploration
+            continue
+        board.push(move)
+        try:
+            if child.expanded and not child.forcing_mixed:
+                assert child._moves is not None and child._priors is not None
+                replies = child._moves
+                priors = child._priors
+                _mix_forcing_priors(board, replies, priors)
+                if child._children is not None:
+                    for reply, prior in zip(replies, priors, strict=True):
+                        materialized = child._children.get(reply)
+                        if materialized is not None:
+                            materialized.prior = float(prior)
+                child.forcing_mixed = True
+            if _mate_in_one(board, list(board.legal_moves)) is not None:
+                child.proven = 1.0
+        finally:
+            board.pop()
 
-    return max(node.children.items(), key=score)
+
+def _select_child(node: SearchNode) -> tuple[chess.Move, SearchNode]:
+    assert node._moves is not None and node._priors is not None
+    parent_scale = math.sqrt(node.visits if node.visits > 0 else 1)
+    parent_value = node.value_sum / node.visits if node.visits else 0.0
+    best_move: chess.Move | None = None
+    best_child: SearchNode | None = None
+    best_prior = 0.0
+    best_score = -math.inf
+    children = node._children
+    for move, raw_prior in zip(node._moves, node._priors, strict=True):
+        child = children.get(move) if children is not None else None
+        prior = float(raw_prior)
+        if child is not None and child.proven is not None:
+            score = 0.0 if child.proven == 0.0 else -math.inf
+        else:
+            exploitation = (
+                -child.value_sum / child.visits
+                if child is not None and child.visits
+                else parent_value - FPU_REDUCTION
+            )
+            visits = child.visits if child is not None else 0
+            score = exploitation + PUCT * prior * parent_scale / (1 + visits)
+        if best_move is None or score > best_score:
+            best_move = move
+            best_child = child
+            best_prior = prior
+            best_score = score
+    assert best_move is not None
+    if best_child is None:
+        best_child = SearchNode(best_prior)
+        node.children[best_move] = best_child
+    return best_move, best_child
 
 
 def _expand_node(
     node: SearchNode,
-    board: chess.Board,
-    prediction: tuple[np.ndarray, float] | None = None,
+    moves: list[chess.Move],
+    prediction: tuple[np.ndarray, float],
+    forcing_board: chess.Board | None = None,
+    materialize: bool = False,
 ) -> float:
-    logits, value = _predict(board) if prediction is None else prediction
-    moves = list(board.legal_moves)
-    if not moves:
-        node.expanded = True
-        return value
-    indices = np.fromiter((action_index(board, move) for move in moves), dtype=np.int64)
-    selected = logits[indices]
-    priors = np.exp(selected - selected.max())
-    priors /= priors.sum()
-    node.children = {
-        move: SearchNode(float(prior)) for move, prior in zip(moves, priors, strict=True)
-    }
-    node.size = 1 + len(node.children)
+    priors, value = prediction
+    priors = priors.copy()
+    if forcing_board is not None:
+        _mix_forcing_priors(forcing_board, moves, priors)
+        node.forcing_mixed = True
+    node._moves = moves
+    node._priors = priors
+    if materialize:
+        node.children = {
+            move: SearchNode(float(prior)) for move, prior in zip(moves, priors, strict=True)
+        }
+        node.size = 1 + len(node.children)
     node.expanded = True
     return value
+
+
+def _mix_forcing_priors(
+    board: chess.Board,
+    moves: list[chess.Move],
+    priors: np.ndarray,
+) -> None:
+    forcing = np.fromiter(
+        (
+            board.gives_check(move) or board.is_capture(move) or move.promotion is not None
+            for move in moves
+        ),
+        dtype=np.bool_,
+        count=len(moves),
+    )
+    forcing_count = int(forcing.sum())
+    if forcing_count:
+        priors *= 1.0 - ROOT_REPLY_FORCING_MIX
+        priors[forcing] += ROOT_REPLY_FORCING_MIX / forcing_count
 
 
 def _predict(board: chess.Board) -> tuple[np.ndarray, float]:
@@ -279,28 +389,37 @@ def _input_key(board: chess.Board) -> tuple[int, ...]:
         board.occupied_co[chess.BLACK],
         int(board.turn),
         board.castling_rights,
+        board.promoted,
         -1 if board.ep_square is None else board.ep_square,
         min(board.halfmove_clock, 100),
     )
 
 
 def _predict_many(boards: list[chess.Board]) -> list[tuple[np.ndarray, float]]:
+    move_lists = [list(board.legal_moves) for board in boards]
+    return _evaluate_many(list(zip(boards, move_lists, strict=True)))
+
+
+def _evaluate_many(
+    positions: list[tuple[chess.Board, list[chess.Move]]],
+) -> list[tuple[np.ndarray, float]]:
     global _CACHE_HITS, _CACHE_MISSES
-    if not boards:
+    if not positions:
         return []
+    boards = [position[0] for position in positions]
     keys = [_input_key(board) for board in boards]
     resolved: dict[tuple[int, ...], tuple[np.ndarray, float]] = {}
-    missing: dict[tuple[int, ...], chess.Board] = {}
-    for key, board in zip(keys, boards, strict=True):
+    missing: dict[tuple[int, ...], tuple[chess.Board, list[chess.Move]]] = {}
+    for key, position in zip(keys, positions, strict=True):
         cached = _EVALUATIONS.get(key)
         if cached is not None:
             _EVALUATIONS.move_to_end(key)
             _CACHE_HITS += 1
             resolved[key] = cached
         elif key not in missing:
-            missing[key] = board
+            missing[key] = position
     if missing:
-        states = np.stack([encode_board(board) for board in missing.values()])
+        states = np.stack([encode_board(board) for board, _ in missing.values()])
         if isinstance(_INFERENCE, ort.InferenceSession):
             raw_policies, raw_values = _INFERENCE.run(None, {"state": states})
         else:
@@ -309,14 +428,27 @@ def _predict_many(boards: list[chess.Board]) -> list[tuple[np.ndarray, float]]:
         if not torch_like:
             policies = np.asarray(raw_policies)
             values = np.asarray(raw_values)
-        for row, key in enumerate(missing):
+        for row, (key, (board, moves)) in enumerate(missing.items()):
             if torch_like:
-                policy = raw_policies[row].clone()
+                policy = raw_policies[row].detach().cpu().numpy()
                 value = float(raw_values[row])
             else:
-                policy = policies[row].copy()
+                policy = policies[row]
                 value = float(values[row])
-            prediction = policy, value
+            indices = np.fromiter(
+                (action_index(board, move) for move in moves),
+                dtype=np.int64,
+                count=len(moves),
+            )
+            selected = np.asarray(policy[indices], dtype=np.float32)
+            if len(selected):
+                priors = np.exp(selected - float(selected.max()))
+                priors /= priors.sum()
+                priors *= 1.0 - POLICY_FLOOR_MIX
+                priors += POLICY_FLOOR_MIX / len(priors)
+            else:
+                priors = selected
+            prediction = priors, value
             _CACHE_MISSES += 1
             if len(_EVALUATIONS) >= MAX_CACHED_EVALUATIONS:
                 _EVALUATIONS.popitem(last=False)
@@ -327,15 +459,22 @@ def _predict_many(boards: list[chess.Board]) -> list[tuple[np.ndarray, float]]:
 
 def _backpropagate(path: list[SearchNode], leaf_value: float, added_nodes: int = 0) -> None:
     value = leaf_value
+    proof_can_propagate = path[-1].proven is not None
     for node in reversed(path):
         if node is not path[-1]:
             node.size += added_nodes
-        if node.proven is None and node.children:
-            proofs = [child.proven for child in node.children.values()]
+        children = node._children
+        if node is not path[-1] and proof_can_propagate and node.proven is None and children:
+            proofs = [child.proven for child in children.values()]
             if -1.0 in proofs:
                 node.proven = 1.0
-            elif all(proof is not None for proof in proofs):
+            elif (
+                node._moves is not None
+                and len(children) == len(node._moves)
+                and all(proof is not None for proof in proofs)
+            ):
                 node.proven = max(-proof for proof in proofs if proof is not None)
+        proof_can_propagate = node.proven is not None
         if node.proven is not None:
             value = node.proven
         node.visits += 1

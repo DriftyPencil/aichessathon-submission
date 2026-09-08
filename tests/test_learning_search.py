@@ -93,6 +93,9 @@ class SearchTests(unittest.TestCase):
         losing.visits = 100
         losing.value_sum = 80.0
         root.children = {chess.Move.from_uci("e2e4"): draw, chess.Move.from_uci("d2d4"): losing}
+        root._moves = list(root.children)
+        root._priors = np.asarray([0.01, 0.99], dtype=np.float32)
+        root.expanded = True
         self.assertIs(agent._select_child(root)[1], draw)
 
     def test_winning_position_still_explores_low_prior_moves(self) -> None:
@@ -107,7 +110,22 @@ class SearchTests(unittest.TestCase):
             chess.Move.from_uci("e2e4"): explored,
             chess.Move.from_uci("d2d4"): unexplored,
         }
+        root._moves = list(root.children)
+        root._priors = np.asarray([0.98, 0.02], dtype=np.float32)
+        root.expanded = True
         self.assertIs(agent._select_child(root)[1], unexplored)
+
+    def test_non_root_expansion_materializes_edges_lazily(self) -> None:
+        board = chess.Board()
+        moves = list(board.legal_moves)
+        root = agent.SearchNode()
+        priors = np.full(len(moves), 1 / len(moves), dtype=np.float32)
+        agent._expand_node(root, moves, (priors, 0.0))
+        self.assertFalse(root.children)
+        move, child = agent._select_child(root)
+        self.assertIn(move, moves)
+        self.assertIs(root.children[move], child)
+        self.assertEqual(len(root.children), 1)
 
     def test_emergency_clock_returns_legal_move_without_inference(self) -> None:
         with patch.object(agent, "_predict", side_effect=AssertionError("inference")):
@@ -162,18 +180,21 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(model.call_count, 1)
         self.assertEqual(model.call_args.args[0].shape[0], 2)
         self.assertIs(predictions[0], predictions[2])
-        self.assertEqual(predictions[0][0].untyped_storage().nbytes(), POLICY_SIZE * 4)
-        self.assertNotEqual(
-            predictions[0][0].untyped_storage().data_ptr(), policies.untyped_storage().data_ptr()
-        )
+        self.assertEqual(predictions[0][0].nbytes, len(list(first.legal_moves)) * 4)
+        self.assertFalse(np.shares_memory(predictions[0][0], policies.numpy()))
 
     def test_batched_search_removes_virtual_visits(self) -> None:
-        def predictions(boards: list[chess.Board]) -> list[tuple[torch.Tensor, float]]:
-            return [(torch.zeros(POLICY_SIZE), 0.0) for _ in boards]
+        def predictions(
+            positions: list[tuple[chess.Board, list[chess.Move]]],
+        ) -> list[tuple[np.ndarray, float]]:
+            return [
+                (np.full(len(moves), 1 / len(moves), dtype=np.float32), 0.0)
+                for _, moves in positions
+            ]
 
         with (
             patch.object(agent, "MAX_SIMULATIONS", 17),
-            patch.object(agent, "_predict_many", side_effect=predictions),
+            patch.object(agent, "_evaluate_many", side_effect=predictions),
         ):
             move = agent._mcts_move(chess.Board(), time.perf_counter() + 10)
         self.assertIn(move, chess.Board().legal_moves)
@@ -192,9 +213,22 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(root.size, counted)
 
     def test_virtual_visits_are_removed_when_batch_inference_fails(self) -> None:
+        calls = 0
+
+        def predictions(
+            positions: list[tuple[chess.Board, list[chess.Move]]],
+        ) -> list[tuple[np.ndarray, float]]:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("failed inference")
+            return [
+                (np.full(len(moves), 1 / len(moves), dtype=np.float32), 0.0)
+                for _, moves in positions
+            ]
+
         with (
-            patch.object(agent, "_predict", return_value=(torch.zeros(POLICY_SIZE), 0.0)),
-            patch.object(agent, "_predict_many", side_effect=RuntimeError("failed inference")),
+            patch.object(agent, "_evaluate_many", side_effect=predictions),
             self.assertRaisesRegex(RuntimeError, "failed inference"),
         ):
             agent._mcts_move(chess.Board(), time.perf_counter() + 10)
