@@ -1,8 +1,12 @@
-"""Hard-evaluation chess agent for local development.
+"""Ground-up hard-evaluation chess agent for local development.
 
-The tuned evaluation parameters and feature families match baselines/experiment.
-The search engine itself is independently implemented around a conventional
-fail-soft PVS/negamax design.
+Search includes iterative deepening, aspiration
+windows, fail-soft PVS/negamax, quiescence, a direct-mapped transposition table,
+null-move pruning, late-move reductions, and history/killer move ordering.
+
+``_Searcher(selective=False, use_tt=False)`` disables every speculative pruning
+rule and the TT while retaining the same PVS and quiescence core. That exact mode
+exists as a correctness oracle for shallow differential tests.
 """
 
 from __future__ import annotations
@@ -15,166 +19,117 @@ import chess.polyglot
 _INFINITY = 2_000_000
 _MATE_SCORE = 1_000_000
 _MAX_PLY = 192
-_TT_SIZE = 1 << 20
+_MATE_TT_THRESHOLD = _MATE_SCORE - _MAX_PLY
+_TT_SIZE = 1 << 21
 _TT_MASK = _TT_SIZE - 1
+_U64_MASK = (1 << 64) - 1
+_RULE_50_KEY = 0x9E3779B97F4A7C15
+_SELECTIVE_TT_KEY = 0xD1B54A32D192ED03
 
 _EXACT = 0
 _LOWER = 1
 _UPPER = 2
 
-# Packed middle-game/endgame parameters shared with baselines/experiment.
-_PACKED_EVALUATION = (
-    0,
-    0,
-    1,
-    1,
-    2,
-    4,
-    0,
-    0,
-    0,
-    458756,
-    393221,
-    393221,
-    524295,
-    1376266,
-    2228250,
-    0,
-    1114134,
-    1376281,
-    1572891,
-    1835037,
-    1900574,
-    1703971,
-    1507359,
-    1441800,
-    1376282,
-    1376284,
-    1441820,
-    1507356,
-    1572892,
-    1507358,
-    1507354,
-    1572883,
-    3014694,
-    2949155,
-    2949156,
-    3145764,
-    3211303,
-    3211307,
-    3276843,
-    3276844,
-    5242956,
-    5374027,
-    5767241,
-    6160455,
-    6422598,
-    6357064,
-    6422596,
-    6160457,
-    -3,
-    -3,
-    -5,
-    -3,
-    262146,
-    196621,
-    131083,
-    -393210,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    983044,
-    917510,
-    786439,
-    655369,
-    720906,
-    720909,
-    786444,
-    720901,
-    1900571,
-    2097183,
-    2359329,
-    2490402,
-    2490402,
-    2359330,
-    2162721,
-    1900574,
-    2162720,
-    2228258,
-    2228258,
-    2293794,
-    2228258,
-    2228257,
-    2228259,
-    2162721,
-    3735588,
-    3735588,
-    3735590,
-    3735591,
-    3735590,
-    3735590,
-    3735588,
-    3670052,
-    6094946,
-    6226019,
-    6291555,
-    6422627,
-    6553698,
-    6553699,
-    6422629,
-    6422628,
-    -2,
-    -131067,
-    -1,
-    -11,
-    -4,
-    -8,
-    3,
-    -393215,
-    0,
-    0,
-    0,
-    458758,
-    262147,
-    196611,
-    -10,
-    0,
-    0,
-    -131063,
-    16,
-    -655324,
-    1179671,
-    -114,
-    0,
-    1703952,
-    -262139,
-    262145,
-    851999,
-    1376259,
-    -30,
-    0,
-    0,
-    0,
-    0,
-    0,
+_PHASE_WEIGHT = (0, 0, 1, 1, 2, 4, 0)
+
+# Tables are indexed by piece type, then by a square from White's perspective.
+# Values already include the old rank/file sum and scale factor.
+_MG_PIECE_SQUARE: tuple[tuple[int, ...], ...] = (
+    (),
+    (
+        32, 48, 56, 72, 80, 104, 96, 40, 64, 80, 88, 104, 112, 136, 128, 72,
+        72, 88, 96, 112, 120, 144, 136, 80, 72, 88, 96, 112, 120, 144, 136, 80,
+        88, 104, 112, 128, 136, 160, 152, 96, 112, 128, 136, 152, 160, 184, 176, 120,
+        240, 256, 264, 280, 288, 312, 304, 248, 32, 48, 56, 72, 80, 104, 96, 40,
+    ),
+    (
+        392, 424, 440, 448, 448, 448, 440, 416, 416, 448, 464, 472, 472, 472, 464, 440,
+        432, 464, 480, 488, 488, 488, 480, 456, 448, 480, 496, 504, 504, 504, 496, 472,
+        456, 488, 504, 512, 512, 512, 504, 480, 496, 528, 544, 552, 552, 552, 544, 520,
+        464, 496, 512, 520, 520, 520, 512, 488, 280, 312, 328, 336, 336, 336, 328, 304,
+    ),
+    (
+        464, 480, 480, 480, 480, 472, 488, 472, 480, 496, 496, 496, 496, 488, 504, 488,
+        480, 496, 496, 496, 496, 488, 504, 488, 480, 496, 496, 496, 496, 488, 504, 488,
+        480, 496, 496, 496, 496, 488, 504, 488, 496, 512, 512, 512, 512, 504, 520, 504,
+        464, 480, 480, 480, 480, 472, 488, 472, 408, 424, 424, 424, 424, 416, 432, 416,
+    ),
+    (
+        592, 592, 608, 616, 608, 608, 592, 592, 568, 568, 584, 592, 584, 584, 568, 568,
+        576, 576, 592, 600, 592, 592, 576, 576, 576, 576, 592, 600, 592, 592, 576, 576,
+        600, 600, 616, 624, 616, 616, 600, 600, 632, 632, 648, 656, 648, 648, 632, 632,
+        632, 632, 648, 656, 648, 648, 632, 632, 640, 640, 656, 664, 656, 656, 640, 640,
+    ),
+    (
+        1392, 1400, 1400, 1400, 1392, 1400, 1416, 1408,
+        1384, 1392, 1392, 1392, 1384, 1392, 1408, 1400,
+        1368, 1376, 1376, 1376, 1368, 1376, 1392, 1384,
+        1352, 1360, 1360, 1360, 1352, 1360, 1376, 1368,
+        1344, 1352, 1352, 1352, 1344, 1352, 1368, 1360,
+        1360, 1368, 1368, 1368, 1360, 1368, 1384, 1376,
+        1328, 1336, 1336, 1336, 1328, 1336, 1352, 1344,
+        1368, 1376, 1376, 1376, 1368, 1376, 1392, 1384,
+    ),
+    (
+        -40, 16, -32, -112, -56, -88, 0, -16, -40, 16, -32, -112, -56, -88, 0, -16,
+        -56, 0, -48, -128, -72, -104, -16, -32, -40, 16, -32, -112, -56, -88, 0, -16,
+        0, 56, 8, -72, -16, -48, 40, 24, 88, 144, 96, 16, 72, 40, 128, 112,
+        72, 128, 80, 0, 56, 24, 112, 96, 32, 88, 40, -40, 16, -16, 72, 56,
+    ),
 )
 
-type ScorePair = tuple[int, int]
+_EG_PIECE_SQUARE: tuple[tuple[int, ...], ...] = (
+    (),
+    (
+        120, 112, 96, 80, 88, 88, 96, 88, 176, 168, 152, 136, 144, 144, 152, 144,
+        168, 160, 144, 128, 136, 136, 144, 136, 168, 160, 144, 128, 136, 136, 144, 136,
+        184, 176, 160, 144, 152, 152, 160, 152, 288, 280, 264, 248, 256, 256, 264, 256,
+        392, 384, 368, 352, 360, 360, 368, 360, 120, 112, 96, 80, 88, 88, 96, 88,
+    ),
+    (
+        368, 392, 424, 440, 440, 424, 400, 368, 400, 424, 456, 472, 472, 456, 432, 400,
+        424, 448, 480, 496, 496, 480, 456, 424, 456, 480, 512, 528, 528, 512, 488, 456,
+        464, 488, 520, 536, 536, 520, 496, 464, 440, 464, 496, 512, 512, 496, 472, 440,
+        416, 440, 472, 488, 488, 472, 448, 416, 408, 432, 464, 480, 480, 464, 440, 408,
+    ),
+    (
+        432, 440, 440, 448, 440, 440, 440, 432, 432, 440, 440, 448, 440, 440, 440, 432,
+        440, 448, 448, 456, 448, 448, 448, 440, 448, 456, 456, 464, 456, 456, 456, 448,
+        456, 464, 464, 472, 464, 464, 464, 456, 448, 456, 456, 464, 456, 456, 456, 448,
+        448, 456, 456, 464, 456, 456, 456, 448, 456, 464, 464, 472, 464, 464, 464, 456,
+    ),
+    (
+        824, 824, 824, 824, 824, 824, 824, 816, 816, 816, 816, 816, 816, 816, 816, 808,
+        816, 816, 816, 816, 816, 816, 816, 808, 840, 840, 840, 840, 840, 840, 840, 832,
+        848, 848, 848, 848, 848, 848, 848, 840, 848, 848, 848, 848, 848, 848, 848, 840,
+        856, 856, 856, 856, 856, 856, 856, 848, 856, 856, 856, 856, 856, 856, 856, 848,
+    ),
+    (
+        1384, 1400, 1408, 1424, 1440, 1440, 1424, 1424,
+        1400, 1416, 1424, 1440, 1456, 1456, 1440, 1440,
+        1448, 1464, 1472, 1488, 1504, 1504, 1488, 1488,
+        1496, 1512, 1520, 1536, 1552, 1552, 1536, 1536,
+        1528, 1544, 1552, 1568, 1584, 1584, 1568, 1568,
+        1520, 1536, 1544, 1560, 1576, 1576, 1560, 1560,
+        1528, 1544, 1552, 1568, 1584, 1584, 1568, 1568,
+        1496, 1512, 1520, 1536, 1552, 1552, 1536, 1536,
+    ),
+    (
+        0, -16, 0, 0, 0, 0, 0, -48, 0, -16, 0, 0, 0, 0, 0, -48,
+        0, -16, 0, 0, 0, 0, 0, -48, 0, -16, 0, 0, 0, 0, 0, -48,
+        32, 16, 32, 32, 32, 32, 32, -16, 24, 8, 24, 24, 24, 24, 24, -24,
+        16, 0, 16, 16, 16, 16, 16, -32, -48, -64, -48, -48, -48, -48, -48, -96,
+    ),
+)
+
+_MG_MOBILITY = (0, 0, 0, 6, 3, 3, -10)
+_EG_MOBILITY = (0, 0, 0, 7, 4, 3, 0)
+_MG_KING_PRESSURE = (0, 0, 9, 16, 36, 23, -114)
+_EG_KING_PRESSURE = (0, 0, -2, 0, -10, 18, 0)
+_MG_OPEN_FILE = (0, 16, 5, 1, 31, 3, -30)
+_EG_OPEN_FILE = (0, 26, -4, 4, 13, 21, 0)
+
 type TTEntry = tuple[int, int, int, int, chess.Move | None]
-
-
-def _signed_short(value: int) -> int:
-    value &= 0xFFFF
-    return value - 0x10000 if value & 0x8000 else value
-
-
-def _decode_score(value: int) -> ScorePair:
-    return _signed_short(value), (value + 0x8000) >> 16
 
 
 def _divide_toward_zero(numerator: int, denominator: int) -> int:
@@ -182,7 +137,6 @@ def _divide_toward_zero(numerator: int, denominator: int) -> int:
     return -quotient if numerator < 0 else quotient
 
 
-_EVALUATION: tuple[ScorePair, ...] = tuple(_decode_score(value) for value in _PACKED_EVALUATION)
 _TT: list[TTEntry | None] = [None] * _TT_SIZE
 _HISTORY = [0] * 4096
 _GAME_BOARD: chess.Board | None = None
@@ -194,6 +148,54 @@ class _SearchTimeout(Exception):
 
 def _move_key(move: chess.Move) -> int:
     return move.from_square | (move.to_square << 6)
+
+
+def _tt_key(board: chess.Board, *, selective: bool) -> int:
+    """Hash the position and the draw-clock state relevant to its score."""
+    position_key = chess.polyglot.zobrist_hash(board)
+    rule_50_count = min(board.halfmove_clock, 100)
+    rule_50_key = ((rule_50_count + 1) * _RULE_50_KEY) & _U64_MASK
+    mode_key = _SELECTIVE_TT_KEY if selective else 0
+    return position_key ^ rule_50_key ^ mode_key
+
+
+def _score_to_tt(score: int, ply: int) -> int:
+    """Store mate scores independently of the path used to reach the node."""
+    if score >= _MATE_TT_THRESHOLD:
+        return score + ply
+    if score <= -_MATE_TT_THRESHOLD:
+        return score - ply
+    return score
+
+
+def _score_from_tt(score: int, ply: int) -> int:
+    if score >= _MATE_TT_THRESHOLD:
+        return score - ply
+    if score <= -_MATE_TT_THRESHOLD:
+        return score + ply
+    return score
+
+
+def _is_search_draw(board: chess.Board, ply: int) -> bool:
+    # At the root, a twofold position is still a live position. Treating it as
+    # an immediate draw leaves iterative deepening without a selected move.
+    if board.is_insufficient_material():
+        return True
+    if board.halfmove_clock >= 100:
+        # Checkmate takes precedence when the mating move also reaches the
+        # fifty-move threshold.
+        return not board.is_checkmate()
+    return ply > 0 and board.is_repetition(2)
+
+
+def _null_move_safe(board: chess.Board) -> bool:
+    """Avoid null-move pruning when the mover has zugzwang-prone material."""
+    color = board.turn
+    major_count = len(board.pieces(chess.ROOK, color)) + len(board.pieces(chess.QUEEN, color))
+    minor_count = len(board.pieces(chess.KNIGHT, color)) + len(
+        board.pieces(chess.BISHOP, color)
+    )
+    return major_count > 0 or minor_count >= 2
 
 
 def _recover_game_board(fen: str) -> chess.Board:
@@ -221,43 +223,43 @@ def _evaluate(board: chess.Board) -> tuple[int, int]:
 
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == board.turn else -1
-        own = board.occupied_co[color]
+        own_pieces = board.occupied_co[color]
         pawns = board.pieces_mask(chess.PAWN, color)
+        pawn_file_counts = [0] * 8
+        for square in chess.scan_forward(pawns):
+            pawn_file_counts[chess.square_file(square)] += 1
+
         enemy_king = board.king(not color)
         king_zone = chess.BB_KING_ATTACKS[enemy_king] if enemy_king is not None else 0
 
         for piece_type in range(chess.PAWN, chess.KING + 1):
             pieces = board.pieces_mask(piece_type, color)
-            phase += _PACKED_EVALUATION[piece_type] * pieces.bit_count()
+            phase += _PHASE_WEIGHT[piece_type] * pieces.bit_count()
 
-            while pieces:
-                square = chess.lsb(pieces)
-                pieces &= pieces - 1
-                relative_square = square if color == chess.WHITE else square ^ 56
+            for square in chess.scan_forward(pieces):
+                relative_square = (
+                    square if color == chess.WHITE else chess.square_mirror(square)
+                )
+                middle_game += sign * _MG_PIECE_SQUARE[piece_type][relative_square]
+                end_game += sign * _EG_PIECE_SQUARE[piece_type][relative_square]
 
-                rank_score = _EVALUATION[piece_type * 8 + relative_square // 8]
-                file_score = _EVALUATION[56 + piece_type * 8 + relative_square % 8]
-                middle_game += sign * 8 * (rank_score[0] + file_score[0])
-                end_game += sign * 8 * (rank_score[1] + file_score[1])
-
-                file_mask = chess.BB_FILES[chess.square_file(square)]
-                other_pawns = pawns & file_mask & ~chess.BB_SQUARES[square]
-                if other_pawns == 0:
-                    open_file_score = _EVALUATION[126 + piece_type]
-                    middle_game += sign * open_file_score[0]
-                    end_game += sign * open_file_score[1]
+                file_index = chess.square_file(square)
+                expected_pawns = 1 if piece_type == chess.PAWN else 0
+                if pawn_file_counts[file_index] == expected_pawns:
+                    middle_game += sign * _MG_OPEN_FILE[piece_type]
+                    end_game += sign * _EG_OPEN_FILE[piece_type]
 
                 if piece_type > chess.KNIGHT:
-                    attacks = board.attacks_mask(square) & ~own
+                    attacks = board.attacks_mask(square) & ~own_pieces
                     mobility = attacks.bit_count()
                     king_pressure = (attacks & king_zone).bit_count()
-                    mobility_score = _EVALUATION[112 + piece_type]
-                    pressure_score = _EVALUATION[119 + piece_type]
                     middle_game += sign * (
-                        mobility_score[0] * mobility + pressure_score[0] * king_pressure
+                        _MG_MOBILITY[piece_type] * mobility
+                        + _MG_KING_PRESSURE[piece_type] * king_pressure
                     )
                     end_game += sign * (
-                        mobility_score[1] * mobility + pressure_score[1] * king_pressure
+                        _EG_MOBILITY[piece_type] * mobility
+                        + _EG_KING_PRESSURE[piece_type] * king_pressure
                     )
 
     phase = min(24, phase)
@@ -269,8 +271,17 @@ def _evaluate(board: chess.Board) -> tuple[int, int]:
 
 
 class _Searcher:
-    def __init__(self, board: chess.Board, time_left_ms: int) -> None:
+    def __init__(
+        self,
+        board: chess.Board,
+        time_left_ms: int,
+        *,
+        selective: bool = True,
+        use_tt: bool = True,
+    ) -> None:
         self.board = board
+        self.selective = selective
+        self.use_tt = use_tt
         self.started = time.perf_counter()
         remaining_ms = max(1, time_left_ms)
         reserve_ms = min(50, max(2, remaining_ms // 20))
@@ -282,13 +293,32 @@ class _Searcher:
         self.nodes = 0
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(_MAX_PLY)]
         self.iteration_root_move: chess.Move | None = None
+        self.completed_depth = 0
+        self.completed_score = 0
 
     def _elapsed_ms(self) -> float:
         return (time.perf_counter() - self.started) * 1000.0
 
     def _check_time(self, *, force: bool = False) -> None:
-        if (force or self.nodes & 1023 == 0) and (self._elapsed_ms() >= self.hard_budget_ms):
+        if (force or self.nodes & 127 == 0) and (self._elapsed_ms() >= self.hard_budget_ms):
             raise _SearchTimeout
+
+    def _store_tt(
+        self,
+        key: int,
+        depth: int,
+        score: int,
+        bound: int,
+        move: chess.Move | None,
+        ply: int,
+    ) -> None:
+        if not self.use_tt:
+            return
+        index = key & _TT_MASK
+        current = _TT[index]
+        if current is not None and current[1] > depth:
+            return
+        _TT[index] = (key, depth, _score_to_tt(score, ply), bound, move)
 
     def _move_order_score(
         self,
@@ -308,6 +338,11 @@ class _Searcher:
             )
             attacker = self.board.piece_type_at(move.from_square) or chess.PAWN
             return 8_000_000 + captured * 100_000 - attacker * 1_000
+        if self.board.gives_check(move):
+            return 7_500_000
+
+        if not self.selective:
+            return 0
 
         first_killer, second_killer = self.killers[min(ply, _MAX_PLY - 1)]
         if move == first_killer:
@@ -322,20 +357,21 @@ class _Searcher:
         ply: int,
         *,
         tactical_only: bool,
-    ) -> list[chess.Move]:
+    ) -> tuple[list[chess.Move], bool]:
+        legal_moves = list(self.board.legal_moves)
         if tactical_only:
             moves = [
                 move
-                for move in self.board.legal_moves
+                for move in legal_moves
                 if self.board.is_capture(move) or move.promotion is not None
             ]
         else:
-            moves = list(self.board.legal_moves)
+            moves = legal_moves
         moves.sort(
             key=lambda move: self._move_order_score(move, tt_move, ply),
             reverse=True,
         )
-        return moves
+        return moves, bool(legal_moves)
 
     def _quiescence(self, alpha: int, beta: int, ply: int) -> int:
         self.nodes += 1
@@ -343,21 +379,59 @@ class _Searcher:
 
         if ply >= _MAX_PLY:
             return _evaluate(self.board)[0]
-        if self.board.is_repetition(2) or self.board.halfmove_clock >= 100:
+        if _is_search_draw(self.board, ply):
             return 0
+
+        original_alpha = alpha
+        original_beta = beta
+        key = 0
+        tt_move: chess.Move | None = None
+        if self.use_tt:
+            key = _tt_key(self.board, selective=self.selective)
+            entry = _TT[key & _TT_MASK]
+            if entry is not None and entry[0] == key and entry[1] == 0:
+                _, _, raw_score, bound, tt_move = entry
+                tt_score = _score_from_tt(raw_score, ply)
+                if bound == _EXACT:
+                    return tt_score
+                if bound == _LOWER:
+                    alpha = max(alpha, tt_score)
+                else:
+                    beta = min(beta, tt_score)
+                if alpha >= beta:
+                    return tt_score
 
         in_check = self.board.is_check()
         stand_pat = _evaluate(self.board)[0]
         if not in_check:
             if stand_pat >= beta:
-                return stand_pat
+                score = stand_pat if any(self.board.generate_legal_moves()) else 0
+                bound = _LOWER if score >= original_beta else _EXACT
+                self._store_tt(key, 0, score, bound, None, ply)
+                return score
             alpha = max(alpha, stand_pat)
 
-        moves = self._ordered_moves(None, ply, tactical_only=not in_check)
+        moves, has_legal_move = self._ordered_moves(
+            tt_move,
+            ply,
+            tactical_only=not in_check,
+        )
         if not moves:
-            return -_MATE_SCORE + ply if in_check else stand_pat
+            score = (
+                -_MATE_SCORE + ply
+                if in_check
+                else (stand_pat if has_legal_move else 0)
+            )
+            bound = _EXACT
+            if score <= original_alpha:
+                bound = _UPPER
+            elif score >= original_beta:
+                bound = _LOWER
+            self._store_tt(key, 0, score, bound, None, ply)
+            return score
 
         best_score = -_INFINITY if in_check else stand_pat
+        best_move: chess.Move | None = None
         for move in moves:
             self.board.push(move)
             try:
@@ -365,11 +439,20 @@ class _Searcher:
             finally:
                 self.board.pop()
 
-            best_score = max(best_score, score)
+            if score > best_score:
+                best_score = score
+                best_move = move
             if score > alpha:
                 alpha = score
                 if alpha >= beta:
                     break
+
+        bound = _EXACT
+        if best_score <= original_alpha:
+            bound = _UPPER
+        elif best_score >= original_beta:
+            bound = _LOWER
+        self._store_tt(key, 0, best_score, bound, best_move, ply)
         return best_score
 
     def _search(
@@ -385,7 +468,7 @@ class _Searcher:
 
         if ply >= _MAX_PLY:
             return _evaluate(self.board)[0]
-        if self.board.is_repetition(2) or self.board.halfmove_clock >= 100:
+        if _is_search_draw(self.board, ply):
             return 0
 
         in_check = self.board.is_check()
@@ -396,29 +479,49 @@ class _Searcher:
 
         original_alpha = alpha
         original_beta = beta
-        key = chess.polyglot.zobrist_hash(self.board)
-        entry = _TT[key & _TT_MASK]
+        key = 0
+        entry: TTEntry | None = None
+        if self.use_tt:
+            key = _tt_key(self.board, selective=self.selective)
+            entry = _TT[key & _TT_MASK]
         tt_move: chess.Move | None = None
+        tt_score: int | None = None
+        tt_bound: int | None = None
 
         if entry is not None and entry[0] == key:
-            _, stored_depth, stored_score, bound, tt_move = entry
+            _, stored_depth, raw_score, tt_bound, tt_move = entry
+            tt_score = _score_from_tt(raw_score, ply)
+            if ply == 0 and tt_move is not None and self.board.is_legal(tt_move):
+                self.iteration_root_move = tt_move
             if stored_depth >= depth:
-                if bound == _EXACT:
-                    return stored_score
-                if bound == _LOWER:
-                    alpha = max(alpha, stored_score)
+                if tt_bound == _EXACT:
+                    return tt_score
+                if tt_bound == _LOWER:
+                    alpha = max(alpha, tt_score)
                 else:
-                    beta = min(beta, stored_score)
+                    beta = min(beta, tt_score)
                 if alpha >= beta:
-                    return stored_score
+                    return tt_score
 
-        static_score, phase = _evaluate(self.board)
+        # Internal iterative reduction is useful when move ordering has no TT
+        # move. It is deliberately excluded from exact verification searches.
+        if self.selective and ply > 0 and depth > 3 and tt_move is None:
+            depth -= 1
+
+        static_score, _ = _evaluate(self.board)
+        if self.selective and tt_score is not None:
+            raises_static = tt_bound in (_EXACT, _LOWER) and tt_score > static_score
+            lowers_static = tt_bound in (_EXACT, _UPPER) and tt_score < static_score
+            if raises_static or lowers_static:
+                static_score = tt_score
         null_window = beta == alpha + 1
-        if null_window and not in_check:
+        if self.selective and null_window and not in_check:
             if depth <= 6 and static_score - depth * 75 >= beta:
-                return static_score
+                return static_score if any(self.board.generate_legal_moves()) else 0
 
-            if allow_null and depth >= 3 and phase > 0 and static_score >= beta:
+            if allow_null and depth >= 3 and _null_move_safe(self.board) and static_score >= beta:
+                if not any(self.board.generate_legal_moves()):
+                    return 0
                 reduction = 3 + depth // 6
                 self.board.push(chess.Move.null())
                 try:
@@ -434,16 +537,20 @@ class _Searcher:
                 if null_score >= beta:
                     return null_score
 
-        moves = self._ordered_moves(tt_move, ply, tactical_only=False)
+        moves, _ = self._ordered_moves(tt_move, ply, tactical_only=False)
         if not moves:
             return -_MATE_SCORE + ply if in_check else 0
 
         best_score = -_INFINITY
         best_move: chess.Move | None = None
         quiets: list[chess.Move] = []
+        prunable_quiets = 0
 
         for move_index, move in enumerate(moves):
             is_quiet = not self.board.is_capture(move) and move.promotion is None
+            gives_check = self.board.gives_check(move)
+            killer_ply = min(ply, _MAX_PLY - 1)
+            is_killer = move in self.killers[killer_ply]
             self.board.push(move)
             try:
                 child_depth = depth - 1
@@ -457,9 +564,24 @@ class _Searcher:
                     )
                 else:
                     reduction = 0
-                    if is_quiet and depth >= 3 and move_index >= 4 and not in_check:
+                    if (
+                        self.selective
+                        and is_quiet
+                        and depth >= 3
+                        and move_index > 4
+                        and not in_check
+                        and not gives_check
+                        and not is_killer
+                    ):
                         history = _HISTORY[_move_key(move)]
-                        reduction = 1 + depth // 7 + move_index // 12 - int(history > 0)
+                        history_sign = int(history > 0) - int(history < 0)
+                        reduction = (
+                            2
+                            + depth // 8
+                            + move_index // 16
+                            + int(null_window)
+                            - history_sign
+                        )
                         reduction = min(reduction, max(0, child_depth - 1))
 
                     score = -self._search(
@@ -498,10 +620,9 @@ class _Searcher:
             if score > alpha:
                 alpha = score
                 if alpha >= beta:
-                    if is_quiet:
-                        bonus = min(2_000, depth * depth)
+                    if self.selective and is_quiet:
+                        bonus = depth * depth
                         _HISTORY[_move_key(move)] += bonus
-                        killer_ply = min(ply, _MAX_PLY - 1)
                         first_killer = self.killers[killer_ply][0]
                         if move != first_killer:
                             self.killers[killer_ply] = [move, first_killer]
@@ -511,20 +632,78 @@ class _Searcher:
 
             if is_quiet:
                 quiets.append(move)
-                if null_window and len(quiets) > 3 + depth * depth:
-                    break
+                if not gives_check:
+                    prunable_quiets += 1
+                    if (
+                        self.selective
+                        and null_window
+                        and prunable_quiets > 3 + depth * depth
+                    ):
+                        break
 
         bound = _EXACT
         if best_score <= original_alpha:
             bound = _UPPER
         elif best_score >= original_beta:
             bound = _LOWER
-        _TT[key & _TT_MASK] = (key, depth, best_score, bound, best_move)
+        self._store_tt(key, depth, best_score, bound, best_move, ply)
         return best_score
+
+    def search_depth(self, depth: int) -> tuple[chess.Move, int]:
+        """Run one full-window iteration for deterministic verification."""
+        if depth < 1:
+            raise ValueError("depth must be positive")
+        if self.board.is_game_over(claim_draw=True):
+            raise ValueError("cannot search a finished position")
+
+        self.iteration_root_move = None
+        score = self._search(depth, -_INFINITY, _INFINITY, 0, False)
+        if self.iteration_root_move is None:
+            raise RuntimeError("completed root search did not select a move")
+        return self.iteration_root_move, score
+
+    def _opponent_has_mate_in_one(self) -> bool:
+        for reply in self.board.legal_moves:
+            if not self.board.gives_check(reply):
+                continue
+            self.board.push(reply)
+            try:
+                if self.board.is_checkmate():
+                    return True
+            finally:
+                self.board.pop()
+        return False
+
+    def _fallback_score(self) -> int:
+        if self.board.is_game_over(claim_draw=True):
+            return 0
+        if self._opponent_has_mate_in_one():
+            return -_MATE_SCORE + 2
+        return -_evaluate(self.board)[0]
+
+    def _fallback_move(self, legal_moves: list[chess.Move]) -> chess.Move:
+        """Choose a deterministic static fallback before a timed iteration."""
+        best_move = legal_moves[0]
+        best_score = -_INFINITY
+        for move in legal_moves:
+            self.board.push(move)
+            try:
+                if self.board.is_checkmate():
+                    return move
+                score = self._fallback_score()
+            finally:
+                self.board.pop()
+            if score > best_score:
+                best_score = score
+                best_move = move
+        return best_move
 
     def choose_move(self) -> chess.Move:
         legal_moves = list(self.board.legal_moves)
-        completed_best = legal_moves[0]
+        if len(legal_moves) == 1:
+            self.completed_depth = 0
+            return legal_moves[0]
+        completed_best = self._fallback_move(legal_moves)
         previous_score = 0
 
         for depth in range(1, 65):
@@ -549,6 +728,8 @@ class _Searcher:
             if self.iteration_root_move is not None:
                 completed_best = self.iteration_root_move
                 previous_score = score
+                self.completed_depth = depth
+                self.completed_score = score
 
         return completed_best
 

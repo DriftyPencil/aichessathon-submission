@@ -30,106 +30,158 @@ _EXACT = 0
 _LOWER = 1
 _UPPER = 2
 
-_PHASE_WEIGHT = (0, 0, 1, 1, 2, 4, 0)
-
-# Tables are indexed by piece type, then by a square from White's perspective.
-# Values already include the old rank/file sum and scale factor.
-_MG_PIECE_SQUARE: tuple[tuple[int, ...], ...] = (
-    (),
-    (
-        32, 48, 56, 72, 80, 104, 96, 40, 64, 80, 88, 104, 112, 136, 128, 72,
-        72, 88, 96, 112, 120, 144, 136, 80, 72, 88, 96, 112, 120, 144, 136, 80,
-        88, 104, 112, 128, 136, 160, 152, 96, 112, 128, 136, 152, 160, 184, 176, 120,
-        240, 256, 264, 280, 288, 312, 304, 248, 32, 48, 56, 72, 80, 104, 96, 40,
-    ),
-    (
-        392, 424, 440, 448, 448, 448, 440, 416, 416, 448, 464, 472, 472, 472, 464, 440,
-        432, 464, 480, 488, 488, 488, 480, 456, 448, 480, 496, 504, 504, 504, 496, 472,
-        456, 488, 504, 512, 512, 512, 504, 480, 496, 528, 544, 552, 552, 552, 544, 520,
-        464, 496, 512, 520, 520, 520, 512, 488, 280, 312, 328, 336, 336, 336, 328, 304,
-    ),
-    (
-        464, 480, 480, 480, 480, 472, 488, 472, 480, 496, 496, 496, 496, 488, 504, 488,
-        480, 496, 496, 496, 496, 488, 504, 488, 480, 496, 496, 496, 496, 488, 504, 488,
-        480, 496, 496, 496, 496, 488, 504, 488, 496, 512, 512, 512, 512, 504, 520, 504,
-        464, 480, 480, 480, 480, 472, 488, 472, 408, 424, 424, 424, 424, 416, 432, 416,
-    ),
-    (
-        592, 592, 608, 616, 608, 608, 592, 592, 568, 568, 584, 592, 584, 584, 568, 568,
-        576, 576, 592, 600, 592, 592, 576, 576, 576, 576, 592, 600, 592, 592, 576, 576,
-        600, 600, 616, 624, 616, 616, 600, 600, 632, 632, 648, 656, 648, 648, 632, 632,
-        632, 632, 648, 656, 648, 648, 632, 632, 640, 640, 656, 664, 656, 656, 640, 640,
-    ),
-    (
-        1392, 1400, 1400, 1400, 1392, 1400, 1416, 1408,
-        1384, 1392, 1392, 1392, 1384, 1392, 1408, 1400,
-        1368, 1376, 1376, 1376, 1368, 1376, 1392, 1384,
-        1352, 1360, 1360, 1360, 1352, 1360, 1376, 1368,
-        1344, 1352, 1352, 1352, 1344, 1352, 1368, 1360,
-        1360, 1368, 1368, 1368, 1360, 1368, 1384, 1376,
-        1328, 1336, 1336, 1336, 1328, 1336, 1352, 1344,
-        1368, 1376, 1376, 1376, 1368, 1376, 1392, 1384,
-    ),
-    (
-        -40, 16, -32, -112, -56, -88, 0, -16, -40, 16, -32, -112, -56, -88, 0, -16,
-        -56, 0, -48, -128, -72, -104, -16, -32, -40, 16, -32, -112, -56, -88, 0, -16,
-        0, 56, 8, -72, -16, -48, 40, 24, 88, 144, 96, 16, 72, 40, 128, 112,
-        72, 128, 80, 0, 56, 24, 112, 96, 32, 88, 40, -40, 16, -16, 72, 56,
-    ),
+_PACKED_EVALUATION = (
+    0,
+    0,
+    1,
+    1,
+    2,
+    4,
+    0,
+    0,
+    0,
+    458756,
+    393221,
+    393221,
+    524295,
+    1376266,
+    2228250,
+    0,
+    1114134,
+    1376281,
+    1572891,
+    1835037,
+    1900574,
+    1703971,
+    1507359,
+    1441800,
+    1376282,
+    1376284,
+    1441820,
+    1507356,
+    1572892,
+    1507358,
+    1507354,
+    1572883,
+    3014694,
+    2949155,
+    2949156,
+    3145764,
+    3211303,
+    3211307,
+    3276843,
+    3276844,
+    5242956,
+    5374027,
+    5767241,
+    6160455,
+    6422598,
+    6357064,
+    6422596,
+    6160457,
+    -3,
+    -3,
+    -5,
+    -3,
+    262146,
+    196621,
+    131083,
+    -393210,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    983044,
+    917510,
+    786439,
+    655369,
+    720906,
+    720909,
+    786444,
+    720901,
+    1900571,
+    2097183,
+    2359329,
+    2490402,
+    2490402,
+    2359330,
+    2162721,
+    1900574,
+    2162720,
+    2228258,
+    2228258,
+    2293794,
+    2228258,
+    2228257,
+    2228259,
+    2162721,
+    3735588,
+    3735588,
+    3735590,
+    3735591,
+    3735590,
+    3735590,
+    3735588,
+    3670052,
+    6094946,
+    6226019,
+    6291555,
+    6422627,
+    6553698,
+    6553699,
+    6422629,
+    6422628,
+    -2,
+    -131067,
+    -1,
+    -11,
+    -4,
+    -8,
+    3,
+    -393215,
+    0,
+    0,
+    0,
+    458758,
+    262147,
+    196611,
+    -10,
+    0,
+    0,
+    -131063,
+    16,
+    -655324,
+    1179671,
+    -114,
+    0,
+    1703952,
+    -262139,
+    262145,
+    851999,
+    1376259,
+    -30,
+    0,
+    0,
+    0,
+    0,
+    0,
 )
 
-_EG_PIECE_SQUARE: tuple[tuple[int, ...], ...] = (
-    (),
-    (
-        120, 112, 96, 80, 88, 88, 96, 88, 176, 168, 152, 136, 144, 144, 152, 144,
-        168, 160, 144, 128, 136, 136, 144, 136, 168, 160, 144, 128, 136, 136, 144, 136,
-        184, 176, 160, 144, 152, 152, 160, 152, 288, 280, 264, 248, 256, 256, 264, 256,
-        392, 384, 368, 352, 360, 360, 368, 360, 120, 112, 96, 80, 88, 88, 96, 88,
-    ),
-    (
-        368, 392, 424, 440, 440, 424, 400, 368, 400, 424, 456, 472, 472, 456, 432, 400,
-        424, 448, 480, 496, 496, 480, 456, 424, 456, 480, 512, 528, 528, 512, 488, 456,
-        464, 488, 520, 536, 536, 520, 496, 464, 440, 464, 496, 512, 512, 496, 472, 440,
-        416, 440, 472, 488, 488, 472, 448, 416, 408, 432, 464, 480, 480, 464, 440, 408,
-    ),
-    (
-        432, 440, 440, 448, 440, 440, 440, 432, 432, 440, 440, 448, 440, 440, 440, 432,
-        440, 448, 448, 456, 448, 448, 448, 440, 448, 456, 456, 464, 456, 456, 456, 448,
-        456, 464, 464, 472, 464, 464, 464, 456, 448, 456, 456, 464, 456, 456, 456, 448,
-        448, 456, 456, 464, 456, 456, 456, 448, 456, 464, 464, 472, 464, 464, 464, 456,
-    ),
-    (
-        824, 824, 824, 824, 824, 824, 824, 816, 816, 816, 816, 816, 816, 816, 816, 808,
-        816, 816, 816, 816, 816, 816, 816, 808, 840, 840, 840, 840, 840, 840, 840, 832,
-        848, 848, 848, 848, 848, 848, 848, 840, 848, 848, 848, 848, 848, 848, 848, 840,
-        856, 856, 856, 856, 856, 856, 856, 848, 856, 856, 856, 856, 856, 856, 856, 848,
-    ),
-    (
-        1384, 1400, 1408, 1424, 1440, 1440, 1424, 1424,
-        1400, 1416, 1424, 1440, 1456, 1456, 1440, 1440,
-        1448, 1464, 1472, 1488, 1504, 1504, 1488, 1488,
-        1496, 1512, 1520, 1536, 1552, 1552, 1536, 1536,
-        1528, 1544, 1552, 1568, 1584, 1584, 1568, 1568,
-        1520, 1536, 1544, 1560, 1576, 1576, 1560, 1560,
-        1528, 1544, 1552, 1568, 1584, 1584, 1568, 1568,
-        1496, 1512, 1520, 1536, 1552, 1552, 1536, 1536,
-    ),
-    (
-        0, -16, 0, 0, 0, 0, 0, -48, 0, -16, 0, 0, 0, 0, 0, -48,
-        0, -16, 0, 0, 0, 0, 0, -48, 0, -16, 0, 0, 0, 0, 0, -48,
-        32, 16, 32, 32, 32, 32, 32, -16, 24, 8, 24, 24, 24, 24, 24, -24,
-        16, 0, 16, 16, 16, 16, 16, -32, -48, -64, -48, -48, -48, -48, -48, -96,
-    ),
-)
-
-_MG_MOBILITY = (0, 0, 0, 6, 3, 3, -10)
-_EG_MOBILITY = (0, 0, 0, 7, 4, 3, 0)
-_MG_KING_PRESSURE = (0, 0, 9, 16, 36, 23, -114)
-_EG_KING_PRESSURE = (0, 0, -2, 0, -10, 18, 0)
-_MG_OPEN_FILE = (0, 16, 5, 1, 31, 3, -30)
-_EG_OPEN_FILE = (0, 26, -4, 4, 13, 21, 0)
-
+type ScorePair = tuple[int, int]
 type TTEntry = tuple[int, int, int, int, chess.Move | None]
+
+
+def _signed_short(value: int) -> int:
+    value &= 0xFFFF
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def _decode_score(value: int) -> ScorePair:
+    return _signed_short(value), (value + 0x8000) >> 16
 
 
 def _divide_toward_zero(numerator: int, denominator: int) -> int:
@@ -137,6 +189,7 @@ def _divide_toward_zero(numerator: int, denominator: int) -> int:
     return -quotient if numerator < 0 else quotient
 
 
+_EVALUATION: tuple[ScorePair, ...] = tuple(_decode_score(value) for value in _PACKED_EVALUATION)
 _TT: list[TTEntry | None] = [None] * _TT_SIZE
 _HISTORY = [0] * 4096
 _GAME_BOARD: chess.Board | None = None
@@ -191,11 +244,9 @@ def _is_search_draw(board: chess.Board, ply: int) -> bool:
 def _null_move_safe(board: chess.Board) -> bool:
     """Avoid null-move pruning when the mover has zugzwang-prone material."""
     color = board.turn
-    major_count = len(board.pieces(chess.ROOK, color)) + len(board.pieces(chess.QUEEN, color))
-    minor_count = len(board.pieces(chess.KNIGHT, color)) + len(
-        board.pieces(chess.BISHOP, color)
-    )
-    return major_count > 0 or minor_count >= 2
+    majors = board.pieces_mask(chess.ROOK, color) | board.pieces_mask(chess.QUEEN, color)
+    minors = board.pieces_mask(chess.KNIGHT, color) | board.pieces_mask(chess.BISHOP, color)
+    return bool(majors) or minors.bit_count() >= 2
 
 
 def _recover_game_board(fen: str) -> chess.Board:
@@ -223,43 +274,43 @@ def _evaluate(board: chess.Board) -> tuple[int, int]:
 
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == board.turn else -1
-        own_pieces = board.occupied_co[color]
+        own = board.occupied_co[color]
         pawns = board.pieces_mask(chess.PAWN, color)
-        pawn_file_counts = [0] * 8
-        for square in chess.scan_forward(pawns):
-            pawn_file_counts[chess.square_file(square)] += 1
-
         enemy_king = board.king(not color)
         king_zone = chess.BB_KING_ATTACKS[enemy_king] if enemy_king is not None else 0
 
         for piece_type in range(chess.PAWN, chess.KING + 1):
             pieces = board.pieces_mask(piece_type, color)
-            phase += _PHASE_WEIGHT[piece_type] * pieces.bit_count()
+            phase += _PACKED_EVALUATION[piece_type] * pieces.bit_count()
 
-            for square in chess.scan_forward(pieces):
-                relative_square = (
-                    square if color == chess.WHITE else chess.square_mirror(square)
-                )
-                middle_game += sign * _MG_PIECE_SQUARE[piece_type][relative_square]
-                end_game += sign * _EG_PIECE_SQUARE[piece_type][relative_square]
+            while pieces:
+                square = chess.lsb(pieces)
+                pieces &= pieces - 1
+                relative_square = square if color == chess.WHITE else square ^ 56
 
-                file_index = chess.square_file(square)
-                expected_pawns = 1 if piece_type == chess.PAWN else 0
-                if pawn_file_counts[file_index] == expected_pawns:
-                    middle_game += sign * _MG_OPEN_FILE[piece_type]
-                    end_game += sign * _EG_OPEN_FILE[piece_type]
+                rank_score = _EVALUATION[piece_type * 8 + relative_square // 8]
+                file_score = _EVALUATION[56 + piece_type * 8 + relative_square % 8]
+                middle_game += sign * 8 * (rank_score[0] + file_score[0])
+                end_game += sign * 8 * (rank_score[1] + file_score[1])
+
+                file_mask = chess.BB_FILES[chess.square_file(square)]
+                other_pawns = pawns & file_mask & ~chess.BB_SQUARES[square]
+                if other_pawns == 0:
+                    open_file_score = _EVALUATION[126 + piece_type]
+                    middle_game += sign * open_file_score[0]
+                    end_game += sign * open_file_score[1]
 
                 if piece_type > chess.KNIGHT:
-                    attacks = board.attacks_mask(square) & ~own_pieces
+                    attacks = board.attacks_mask(square) & ~own
                     mobility = attacks.bit_count()
                     king_pressure = (attacks & king_zone).bit_count()
+                    mobility_score = _EVALUATION[112 + piece_type]
+                    pressure_score = _EVALUATION[119 + piece_type]
                     middle_game += sign * (
-                        _MG_MOBILITY[piece_type] * mobility
-                        + _MG_KING_PRESSURE[piece_type] * king_pressure
+                        mobility_score[0] * mobility + pressure_score[0] * king_pressure
                     )
                     end_game += sign * (
-                        _EG_MOBILITY[piece_type] * mobility
-                        + _EG_KING_PRESSURE[piece_type] * king_pressure
+                        mobility_score[1] * mobility + pressure_score[1] * king_pressure
                     )
 
     phase = min(24, phase)
