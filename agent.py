@@ -191,11 +191,9 @@ def _is_search_draw(board: chess.Board, ply: int) -> bool:
 def _null_move_safe(board: chess.Board) -> bool:
     """Avoid null-move pruning when the mover has zugzwang-prone material."""
     color = board.turn
-    major_count = len(board.pieces(chess.ROOK, color)) + len(board.pieces(chess.QUEEN, color))
-    minor_count = len(board.pieces(chess.KNIGHT, color)) + len(
-        board.pieces(chess.BISHOP, color)
-    )
-    return major_count > 0 or minor_count >= 2
+    majors = board.pieces_mask(chess.ROOK, color) | board.pieces_mask(chess.QUEEN, color)
+    minors = board.pieces_mask(chess.KNIGHT, color) | board.pieces_mask(chess.BISHOP, color)
+    return bool(majors) or minors.bit_count() >= 2
 
 
 def _recover_game_board(fen: str) -> chess.Board:
