@@ -138,6 +138,8 @@ def _divide_toward_zero(numerator: int, denominator: int) -> int:
 
 
 _TT: list[TTEntry | None] = [None] * _TT_SIZE
+_TT_AGE = [0] * _TT_SIZE
+_TT_GENERATION = 0
 _HISTORY = [0] * 4096
 _GAME_BOARD: chess.Board | None = None
 
@@ -196,6 +198,64 @@ def _null_move_safe(board: chess.Board) -> bool:
     return bool(majors) or minors.bit_count() >= 2
 
 
+def _gives_check(board: chess.Board, move: chess.Move) -> bool:
+    """Probe checks without the push/pop performed by ``Board.gives_check``."""
+    color = board.turn
+    king = board.king(not color)
+    if king is None:
+        return False
+
+    from_mask = chess.BB_SQUARES[move.from_square]
+    to_mask = chess.BB_SQUARES[move.to_square]
+    occupied = (board.occupied & ~from_mask) | to_mask
+    if board.is_en_passant(move):
+        captured_square = move.to_square - 8 if color else move.to_square + 8
+        occupied &= ~chess.BB_SQUARES[captured_square]
+
+    piece_type = move.promotion or board.piece_type_at(move.from_square)
+    if piece_type == chess.PAWN:
+        direct_attacks = chess.BB_PAWN_ATTACKS[color][move.to_square]
+    elif piece_type == chess.KNIGHT:
+        direct_attacks = chess.BB_KNIGHT_ATTACKS[move.to_square]
+    elif piece_type == chess.BISHOP:
+        direct_attacks = chess.BB_DIAG_ATTACKS[move.to_square][
+            chess.BB_DIAG_MASKS[move.to_square] & occupied
+        ]
+    elif piece_type == chess.ROOK:
+        direct_attacks = (
+            chess.BB_RANK_ATTACKS[move.to_square][
+                chess.BB_RANK_MASKS[move.to_square] & occupied
+            ]
+            | chess.BB_FILE_ATTACKS[move.to_square][
+                chess.BB_FILE_MASKS[move.to_square] & occupied
+            ]
+        )
+    elif piece_type == chess.QUEEN:
+        direct_attacks = (
+            chess.BB_DIAG_ATTACKS[move.to_square][
+                chess.BB_DIAG_MASKS[move.to_square] & occupied
+            ]
+            | chess.BB_RANK_ATTACKS[move.to_square][
+                chess.BB_RANK_MASKS[move.to_square] & occupied
+            ]
+            | chess.BB_FILE_ATTACKS[move.to_square][
+                chess.BB_FILE_MASKS[move.to_square] & occupied
+            ]
+        )
+    else:
+        direct_attacks = chess.BB_KING_ATTACKS[move.to_square]
+
+    if direct_attacks & chess.BB_SQUARES[king]:
+        return True
+    if board.is_castling(move):
+        return board.gives_check(move)
+    if not board.is_en_passant(move) and not chess.ray(move.from_square, king):
+        return False
+
+    discovered_attackers = board.attackers_mask(color, king, occupied) & ~from_mask
+    return bool(discovered_attackers)
+
+
 def _recover_game_board(fen: str) -> chess.Board:
     """Recover the opponent's ply so repetition checks retain history."""
     global _GAME_BOARD
@@ -223,9 +283,6 @@ def _evaluate(board: chess.Board) -> tuple[int, int]:
         sign = 1 if color == board.turn else -1
         own_pieces = board.occupied_co[color]
         pawns = board.pieces_mask(chess.PAWN, color)
-        pawn_file_counts = [0] * 8
-        for square in chess.scan_forward(pawns):
-            pawn_file_counts[chess.square_file(square)] += 1
 
         enemy_king = board.king(not color)
         king_zone = chess.BB_KING_ATTACKS[enemy_king] if enemy_king is not None else 0
@@ -234,16 +291,17 @@ def _evaluate(board: chess.Board) -> tuple[int, int]:
             pieces = board.pieces_mask(piece_type, color)
             phase += _PHASE_WEIGHT[piece_type] * pieces.bit_count()
 
-            for square in chess.scan_forward(pieces):
+            while pieces:
+                square = chess.lsb(pieces)
+                pieces &= pieces - 1
                 relative_square = (
                     square if color == chess.WHITE else chess.square_mirror(square)
                 )
                 middle_game += sign * _MG_PIECE_SQUARE[piece_type][relative_square]
                 end_game += sign * _EG_PIECE_SQUARE[piece_type][relative_square]
 
-                file_index = chess.square_file(square)
-                expected_pawns = 1 if piece_type == chess.PAWN else 0
-                if pawn_file_counts[file_index] == expected_pawns:
+                same_file_pawns = pawns & chess.BB_FILES[chess.square_file(square)]
+                if same_file_pawns & ~chess.BB_SQUARES[square] == 0:
                     middle_game += sign * _MG_OPEN_FILE[piece_type]
                     end_game += sign * _EG_OPEN_FILE[piece_type]
 
@@ -291,6 +349,7 @@ class _Searcher:
         self.nodes = 0
         self.killers: list[list[chess.Move | None]] = [[None, None] for _ in range(_MAX_PLY)]
         self.iteration_root_move: chess.Move | None = None
+        self.iteration_root_moves_completed = 0
         self.completed_depth = 0
         self.completed_score = 0
 
@@ -315,8 +374,12 @@ class _Searcher:
         index = key & _TT_MASK
         current = _TT[index]
         if current is not None and current[1] > depth:
-            return
+            same_position = current[0] == key
+            current_generation = _TT_AGE[index] == _TT_GENERATION
+            if same_position or current_generation:
+                return
         _TT[index] = (key, depth, _score_to_tt(score, ply), bound, move)
+        _TT_AGE[index] = _TT_GENERATION
 
     def _move_order_score(
         self,
@@ -336,7 +399,7 @@ class _Searcher:
             )
             attacker = self.board.piece_type_at(move.from_square) or chess.PAWN
             return 8_000_000 + captured * 100_000 - attacker * 1_000
-        if self.board.gives_check(move):
+        if _gives_check(self.board, move):
             return 7_500_000
 
         if not self.selective:
@@ -356,20 +419,241 @@ class _Searcher:
         *,
         tactical_only: bool,
     ) -> tuple[list[chess.Move], bool]:
-        legal_moves = list(self.board.legal_moves)
         if tactical_only:
-            moves = [
-                move
-                for move in legal_moves
-                if self.board.is_capture(move) or move.promotion is not None
-            ]
+            moves = list(self.board.generate_legal_captures())
+            promotion_rank = chess.BB_RANK_7 if self.board.turn else chess.BB_RANK_2
+            promotion_pawns = (
+                self.board.pieces_mask(chess.PAWN, self.board.turn) & promotion_rank
+            )
+            if promotion_pawns:
+                moves.extend(
+                    move
+                    for move in self.board.generate_legal_moves(from_mask=promotion_pawns)
+                    if move.promotion is not None and not self.board.is_capture(move)
+                )
+            has_legal_move = bool(moves) or any(self.board.generate_legal_moves())
         else:
-            moves = legal_moves
+            moves = list(self.board.legal_moves)
+            has_legal_move = bool(moves)
         moves.sort(
             key=lambda move: self._move_order_score(move, tt_move, ply),
             reverse=True,
         )
-        return moves, bool(legal_moves)
+        return moves, has_legal_move
+
+    def _selective_move_order_score(
+        self,
+        move: chess.Move,
+        tt_move: chess.Move | None,
+        ply: int,
+    ) -> int:
+        if move == tt_move:
+            return 20_000_000
+        if self.board.is_capture(move):
+            captured = (
+                chess.PAWN
+                if self.board.is_en_passant(move)
+                else self.board.piece_type_at(move.to_square) or chess.PAWN
+            )
+            attacker = self.board.piece_type_at(move.from_square) or chess.PAWN
+            return 8_000_000 + captured * 100_000 - attacker
+        if move == self.killers[min(ply, _MAX_PLY - 1)][0]:
+            return 7_000_000
+        return _HISTORY[_move_key(move)]
+
+    def _search_selective(
+        self,
+        depth: int,
+        alpha: int,
+        beta: int,
+        ply: int,
+        allow_null: bool,
+    ) -> int:
+        """Fast competition search, kept semantically aligned with experiment."""
+        self.nodes += 1
+        if ply >= _MAX_PLY:
+            return _evaluate(self.board)[0]
+        if self.board.halfmove_clock >= 100:
+            return 0 if not self.board.is_checkmate() else -_MATE_SCORE + ply
+        if not (self.board.pawns | self.board.rooks | self.board.queens) and (
+            self.board.is_insufficient_material()
+        ):
+            return 0
+        if allow_null and self.board.is_repetition(2):
+            return 0
+
+        in_check = self.board.is_check()
+        if in_check:
+            depth += 1
+
+        in_qsearch = depth <= 0
+        null_window = beta == alpha + 1
+        original_alpha = alpha
+        best_score = -_INFINITY
+        static_score, phase = _evaluate(self.board)
+        key = chess.polyglot.zobrist_hash(self.board)
+        index = key & _TT_MASK
+        entry = _TT[index] if self.use_tt else None
+        tt_move: chess.Move | None = None
+        tt_score: int | None = None
+        tt_bound: int | None = None
+
+        if entry is not None and entry[0] == key:
+            _, tt_depth, raw_score, tt_bound, tt_move = entry
+            tt_score = _score_from_tt(raw_score, ply)
+            if tt_depth >= depth and null_window:
+                usable_lower = tt_bound in (_EXACT, _LOWER) and tt_score >= beta
+                usable_upper = tt_bound in (_EXACT, _UPPER) and tt_score <= alpha
+                if usable_lower or usable_upper:
+                    return tt_score
+
+            raises_static = tt_bound in (_EXACT, _LOWER) and tt_score > static_score
+            lowers_static = tt_bound in (_EXACT, _UPPER) and tt_score < static_score
+            if raises_static or lowers_static:
+                static_score = tt_score
+        elif depth > 3:
+            depth -= 1
+
+        if in_qsearch:
+            if static_score >= beta:
+                if any(self.board.generate_legal_moves()):
+                    return static_score
+                return -_MATE_SCORE + ply if in_check else 0
+            alpha = max(alpha, static_score)
+            best_score = static_score
+        elif null_window and not in_check:
+            if depth < 7 and static_score - depth * 75 > beta:
+                return static_score if any(self.board.generate_legal_moves()) else 0
+
+            if allow_null and static_score >= beta and depth > 2 and phase != 0:
+                if not any(self.board.generate_legal_moves()):
+                    return 0
+                self.board.push(chess.Move.null())
+                try:
+                    null_score = -self._search_selective(
+                        depth - (4 + depth // 6),
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        False,
+                    )
+                finally:
+                    self.board.pop()
+                if null_score >= beta:
+                    return beta
+
+        moves = (
+            list(self.board.generate_legal_captures())
+            if in_qsearch
+            else list(self.board.legal_moves)
+        )
+        moves.sort(
+            key=lambda move: self._selective_move_order_score(move, tt_move, ply),
+            reverse=True,
+        )
+
+        hash_move = tt_move
+        quiets: list[chess.Move] = []
+        moves_searched = 0
+        cutoff = False
+
+        for move in moves:
+            is_quiet = not self.board.is_capture(move)
+            self.board.push(move)
+            try:
+                if in_qsearch or moves_searched == 0:
+                    score = -self._search_selective(
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        True,
+                    )
+                else:
+                    reduction = 0
+                    if depth > 2 and moves_searched > 4 and is_quiet:
+                        history = _HISTORY[_move_key(move)]
+                        history_sign = int(history > 0) - int(history < 0)
+                        reduction = (
+                            2
+                            + depth // 8
+                            + moves_searched // 16
+                            + int(null_window and not in_check)
+                            - history_sign
+                        )
+                        score = -self._search_selective(
+                            depth - reduction,
+                            -alpha - 1,
+                            -alpha,
+                            ply + 1,
+                            True,
+                        )
+                    else:
+                        score = alpha
+
+                    if reduction == 0 or score > alpha:
+                        score = -self._search_selective(
+                            depth - 1,
+                            -alpha - 1,
+                            -alpha,
+                            ply + 1,
+                            True,
+                        )
+                        if alpha < score < beta:
+                            score = -self._search_selective(
+                                depth - 1,
+                                -beta,
+                                -alpha,
+                                ply + 1,
+                                True,
+                            )
+            finally:
+                self.board.pop()
+
+            moves_searched += 1
+            if ply == 0:
+                self.iteration_root_moves_completed += 1
+            if score > best_score:
+                best_score = score
+            if score > alpha:
+                alpha = score
+                hash_move = move
+                if ply == 0:
+                    self.iteration_root_move = move
+                if alpha >= beta:
+                    cutoff = True
+                    if is_quiet:
+                        bonus = depth * depth
+                        _HISTORY[_move_key(move)] += bonus
+                        killer_ply = min(ply, _MAX_PLY - 1)
+                        self.killers[killer_ply][0] = move
+                        for prior_move in quiets:
+                            _HISTORY[_move_key(prior_move)] -= bonus
+                    break
+
+            if is_quiet:
+                quiets.append(move)
+            if null_window and not in_check and len(quiets) > 3 + depth * depth:
+                break
+            if depth > 2 and self._elapsed_ms() >= self.hard_budget_ms:
+                return best_score
+
+        if moves_searched == 0:
+            if in_qsearch:
+                return best_score
+            return -_MATE_SCORE + ply if in_check else 0
+
+        bound = _LOWER if cutoff else (_EXACT if best_score > original_alpha else _UPPER)
+        if self.use_tt:
+            _TT[index] = (
+                key,
+                0 if in_qsearch else depth,
+                _score_to_tt(best_score, ply),
+                bound,
+                hash_move,
+            )
+            _TT_AGE[index] = _TT_GENERATION
+        return best_score
 
     def _quiescence(self, alpha: int, beta: int, ply: int) -> int:
         self.nodes += 1
@@ -401,7 +685,8 @@ class _Searcher:
 
         in_check = self.board.is_check()
         stand_pat = _evaluate(self.board)[0]
-        if not in_check:
+        search_all_evasions = in_check and not self.selective
+        if not search_all_evasions:
             if stand_pat >= beta:
                 score = stand_pat if any(self.board.generate_legal_moves()) else 0
                 bound = _LOWER if score >= original_beta else _EXACT
@@ -412,14 +697,13 @@ class _Searcher:
         moves, has_legal_move = self._ordered_moves(
             tt_move,
             ply,
-            tactical_only=not in_check,
+            tactical_only=not search_all_evasions,
         )
         if not moves:
-            score = (
-                -_MATE_SCORE + ply
-                if in_check
-                else (stand_pat if has_legal_move else 0)
-            )
+            if in_check and not has_legal_move:
+                score = -_MATE_SCORE + ply
+            else:
+                score = stand_pat if has_legal_move else 0
             bound = _EXACT
             if score <= original_alpha:
                 bound = _UPPER
@@ -428,7 +712,7 @@ class _Searcher:
             self._store_tt(key, 0, score, bound, None, ply)
             return score
 
-        best_score = -_INFINITY if in_check else stand_pat
+        best_score = -_INFINITY if search_all_evasions else stand_pat
         best_move: chess.Move | None = None
         for move in moves:
             self.board.push(move)
@@ -461,6 +745,9 @@ class _Searcher:
         ply: int,
         allow_null: bool,
     ) -> int:
+        if self.selective:
+            return self._search_selective(depth, alpha, beta, ply, allow_null)
+
         self.nodes += 1
         self._check_time()
 
@@ -485,13 +772,14 @@ class _Searcher:
         tt_move: chess.Move | None = None
         tt_score: int | None = None
         tt_bound: int | None = None
+        tt_depth = -1
 
         if entry is not None and entry[0] == key:
-            _, stored_depth, raw_score, tt_bound, tt_move = entry
+            _, tt_depth, raw_score, tt_bound, tt_move = entry
             tt_score = _score_from_tt(raw_score, ply)
             if ply == 0 and tt_move is not None and self.board.is_legal(tt_move):
                 self.iteration_root_move = tt_move
-            if stored_depth >= depth:
+            if tt_depth >= depth:
                 if tt_bound == _EXACT:
                     return tt_score
                 if tt_bound == _LOWER:
@@ -507,7 +795,7 @@ class _Searcher:
             depth -= 1
 
         static_score, _ = _evaluate(self.board)
-        if self.selective and tt_score is not None:
+        if self.selective and tt_score is not None and tt_depth >= depth:
             raises_static = tt_bound in (_EXACT, _LOWER) and tt_score > static_score
             lowers_static = tt_bound in (_EXACT, _UPPER) and tt_score < static_score
             if raises_static or lowers_static:
@@ -533,7 +821,9 @@ class _Searcher:
                 finally:
                     self.board.pop()
                 if null_score >= beta:
-                    return null_score
+                    # A null move is only a pruning proof, not a legal line whose
+                    # fail-soft score may be propagated through the real tree.
+                    return beta
 
         moves, _ = self._ordered_moves(tt_move, ply, tactical_only=False)
         if not moves:
@@ -546,9 +836,6 @@ class _Searcher:
 
         for move_index, move in enumerate(moves):
             is_quiet = not self.board.is_capture(move) and move.promotion is None
-            gives_check = self.board.gives_check(move)
-            killer_ply = min(ply, _MAX_PLY - 1)
-            is_killer = move in self.killers[killer_ply]
             self.board.push(move)
             try:
                 child_depth = depth - 1
@@ -562,14 +849,13 @@ class _Searcher:
                     )
                 else:
                     reduction = 0
+                    reduced_depth = child_depth
                     if (
                         self.selective
                         and is_quiet
                         and depth >= 3
                         and move_index > 4
                         and not in_check
-                        and not gives_check
-                        and not is_killer
                     ):
                         history = _HISTORY[_move_key(move)]
                         history_sign = int(history > 0) - int(history < 0)
@@ -580,10 +866,10 @@ class _Searcher:
                             + int(null_window)
                             - history_sign
                         )
-                        reduction = min(reduction, max(0, child_depth - 1))
+                        reduced_depth = max(0, depth - reduction)
 
                     score = -self._search(
-                        child_depth - reduction,
+                        child_depth if reduction == 0 else reduced_depth,
                         -alpha - 1,
                         -alpha,
                         ply + 1,
@@ -608,7 +894,8 @@ class _Searcher:
             finally:
                 self.board.pop()
 
-            self._check_time(force=ply == 0)
+            if ply == 0:
+                self.iteration_root_moves_completed += 1
             if score > best_score:
                 best_score = score
                 best_move = move
@@ -621,6 +908,7 @@ class _Searcher:
                     if self.selective and is_quiet:
                         bonus = depth * depth
                         _HISTORY[_move_key(move)] += bonus
+                        killer_ply = min(ply, _MAX_PLY - 1)
                         first_killer = self.killers[killer_ply][0]
                         if move != first_killer:
                             self.killers[killer_ply] = [move, first_killer]
@@ -630,14 +918,14 @@ class _Searcher:
 
             if is_quiet:
                 quiets.append(move)
-                if not gives_check:
-                    prunable_quiets += 1
-                    if (
-                        self.selective
-                        and null_window
-                        and prunable_quiets > 3 + depth * depth
-                    ):
-                        break
+                prunable_quiets += 1
+                if (
+                    self.selective
+                    and null_window
+                    and prunable_quiets > 3 + depth * depth
+                ):
+                    break
+            self._check_time(force=ply == 0)
 
         bound = _EXACT
         if best_score <= original_alpha:
@@ -701,17 +989,45 @@ class _Searcher:
         if len(legal_moves) == 1:
             self.completed_depth = 0
             return legal_moves[0]
+        if self.selective:
+            fallback = self._fallback_move(legal_moves)
+            score = 0
+            depth = 1
+            while self._elapsed_ms() <= self.soft_budget_ms:
+                window = 40
+                while True:
+                    alpha = score - window
+                    beta = score + window
+                    self.iteration_root_moves_completed = 0
+                    score = self._search_selective(depth, alpha, beta, 0, False)
+                    if self._elapsed_ms() >= self.hard_budget_ms:
+                        break
+                    if alpha < score < beta:
+                        self.completed_depth = depth
+                        self.completed_score = score
+                        break
+                    window *= 2
+                depth += 1
+            return self.iteration_root_move or fallback
+
         completed_best = self._fallback_move(legal_moves)
         previous_score = 0
+        stable_iterations = 0
+        score_change = _INFINITY
+        aspiration_window = 35
 
         for depth in range(1, 65):
             if depth > 1 and self._elapsed_ms() >= self.soft_budget_ms:
-                break
+                stable = stable_iterations >= 2 and score_change < aspiration_window
+                extension_limit = min(self.hard_budget_ms, self.soft_budget_ms * 3)
+                if stable or self._elapsed_ms() >= extension_limit:
+                    break
 
-            window = 35
+            window = aspiration_window
             try:
                 while True:
                     self.iteration_root_move = None
+                    self.iteration_root_moves_completed = 0
                     alpha = previous_score - window
                     beta = previous_score + window
                     score = self._search(depth, alpha, beta, 0, False)
@@ -721,9 +1037,21 @@ class _Searcher:
                         continue
                     break
             except _SearchTimeout:
+                if (
+                    self.completed_depth > 0
+                    and self.iteration_root_moves_completed > 0
+                    and self.iteration_root_move is not None
+                ):
+                    completed_best = self.iteration_root_move
                 break
 
             if self.iteration_root_move is not None:
+                stable_iterations = (
+                    stable_iterations + 1
+                    if self.iteration_root_move == completed_best
+                    else 0
+                )
+                score_change = abs(score - previous_score)
                 completed_best = self.iteration_root_move
                 previous_score = score
                 self.completed_depth = depth
@@ -734,12 +1062,13 @@ class _Searcher:
 
 def get_move(fen: str, time_left_ms: int) -> str:
     """Choose a legal UCI move for the side to move in the supplied FEN."""
-    global _GAME_BOARD
+    global _GAME_BOARD, _TT_GENERATION
 
     board = _recover_game_board(fen)
     if board.is_game_over(claim_draw=True):
         return "0000"
 
+    _TT_GENERATION += 1
     for index, value in enumerate(_HISTORY):
         _HISTORY[index] = _divide_toward_zero(value, 8)
 
