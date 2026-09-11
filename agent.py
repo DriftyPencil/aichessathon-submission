@@ -342,7 +342,7 @@ class _Searcher:
         remaining_ms = max(1, time_left_ms)
         reserve_ms = min(50, max(2, remaining_ms // 20))
         self.hard_budget_ms = min(
-            max(1, remaining_ms // 8),
+            max(1, remaining_ms // 6),
             max(1, remaining_ms - reserve_ms),
         )
         self.soft_budget_ms = max(1, self.hard_budget_ms // 5)
@@ -457,6 +457,8 @@ class _Searcher:
             )
             attacker = self.board.piece_type_at(move.from_square) or chess.PAWN
             return 8_000_000 + captured * 100_000 - attacker
+        if _gives_check(self.board, move):
+            return 7_500_000
         if move == self.killers[min(ply, _MAX_PLY - 1)][0]:
             return 7_000_000
         return _HISTORY[_move_key(move)]
@@ -488,7 +490,6 @@ class _Searcher:
 
         in_qsearch = depth <= 0
         null_window = beta == alpha + 1
-        original_alpha = alpha
         best_score = -_INFINITY
         static_score, phase = _evaluate(self.board)
         key = chess.polyglot.zobrist_hash(self.board)
@@ -500,7 +501,9 @@ class _Searcher:
 
         if entry is not None and entry[0] == key:
             _, tt_depth, raw_score, tt_bound, tt_move = entry
-            tt_score = _score_from_tt(raw_score, ply)
+            # The selective search's mate values are already root-relative.
+            # Re-normalizing them changes the experiment algorithm's bounds.
+            tt_score = raw_score
             if tt_depth >= depth and null_window:
                 usable_lower = tt_bound in (_EXACT, _LOWER) and tt_score >= beta
                 usable_upper = tt_bound in (_EXACT, _UPPER) and tt_score <= alpha
@@ -514,7 +517,7 @@ class _Searcher:
         elif depth > 3:
             depth -= 1
 
-        if in_qsearch:
+        if in_qsearch and not in_check:
             if static_score >= beta:
                 if any(self.board.generate_legal_moves()):
                     return static_score
@@ -542,11 +545,20 @@ class _Searcher:
                 if null_score >= beta:
                     return beta
 
-        moves = (
-            list(self.board.generate_legal_captures())
-            if in_qsearch
-            else list(self.board.legal_moves)
-        )
+        if in_qsearch and not in_check:
+            moves = list(self.board.generate_legal_captures())
+            promotion_rank = chess.BB_RANK_7 if self.board.turn else chess.BB_RANK_2
+            promotion_pawns = (
+                self.board.pieces_mask(chess.PAWN, self.board.turn) & promotion_rank
+            )
+            if promotion_pawns:
+                moves.extend(
+                    move
+                    for move in self.board.generate_legal_moves(from_mask=promotion_pawns)
+                    if move.promotion is not None and not self.board.is_capture(move)
+                )
+        else:
+            moves = list(self.board.legal_moves)
         moves.sort(
             key=lambda move: self._selective_move_order_score(move, tt_move, ply),
             reverse=True,
@@ -555,10 +567,13 @@ class _Searcher:
         hash_move = tt_move
         quiets: list[chess.Move] = []
         moves_searched = 0
-        cutoff = False
+        prunable_quiets = 0
+        tt_bound = _UPPER
 
         for move in moves:
-            is_quiet = not self.board.is_capture(move)
+            is_quiet = not self.board.is_capture(move) and move.promotion is None
+            gives_check = is_quiet and _gives_check(self.board, move)
+            is_killer = move == self.killers[min(ply, _MAX_PLY - 1)][0]
             self.board.push(move)
             try:
                 if in_qsearch or moves_searched == 0:
@@ -571,7 +586,13 @@ class _Searcher:
                     )
                 else:
                     reduction = 0
-                    if depth > 2 and moves_searched > 4 and is_quiet:
+                    if (
+                        depth > 2
+                        and moves_searched > 4
+                        and is_quiet
+                        and not gives_check
+                        and not is_killer
+                    ):
                         history = _HISTORY[_move_key(move)]
                         history_sign = int(history > 0) - int(history < 0)
                         reduction = (
@@ -610,46 +631,57 @@ class _Searcher:
             finally:
                 self.board.pop()
 
+            # A child that returned after the hard deadline may itself contain
+            # a partial subtree. Do not let that score replace a completed move.
+            if depth > 2 and self._elapsed_ms() > self.hard_budget_ms:
+                return best_score
+
             moves_searched += 1
             if ply == 0:
                 self.iteration_root_moves_completed += 1
             if score > best_score:
                 best_score = score
-            if score > alpha:
-                alpha = score
-                hash_move = move
-                if ply == 0:
-                    self.iteration_root_move = move
-                if alpha >= beta:
-                    cutoff = True
-                    if is_quiet:
-                        bonus = depth * depth
-                        _HISTORY[_move_key(move)] += bonus
-                        killer_ply = min(ply, _MAX_PLY - 1)
-                        self.killers[killer_ply][0] = move
-                        for prior_move in quiets:
-                            _HISTORY[_move_key(prior_move)] -= bonus
-                    break
+                if score > alpha:
+                    alpha = score
+                    hash_move = move
+                    tt_bound = _EXACT
+                    if ply == 0:
+                        self.iteration_root_move = move
+                    if alpha >= beta:
+                        tt_bound = _LOWER
+                        if is_quiet:
+                            bonus = depth * depth
+                            _HISTORY[_move_key(move)] += bonus
+                            killer_ply = min(ply, _MAX_PLY - 1)
+                            self.killers[killer_ply][0] = move
+                            for prior_move in quiets:
+                                _HISTORY[_move_key(prior_move)] -= bonus
+                        break
 
             if is_quiet:
                 quiets.append(move)
-            if null_window and not in_check and len(quiets) > 3 + depth * depth:
-                break
-            if depth > 2 and self._elapsed_ms() >= self.hard_budget_ms:
-                return best_score
+                if not gives_check:
+                    prunable_quiets += 1
+                    if (
+                        null_window
+                        and not in_check
+                        and prunable_quiets > 3 + depth * depth
+                    ):
+                        break
 
         if moves_searched == 0:
+            if in_check:
+                return -_MATE_SCORE + ply
             if in_qsearch:
                 return best_score
-            return -_MATE_SCORE + ply if in_check else 0
+            return 0
 
-        bound = _LOWER if cutoff else (_EXACT if best_score > original_alpha else _UPPER)
         if self.use_tt:
             _TT[index] = (
                 key,
                 0 if in_qsearch else depth,
-                _score_to_tt(best_score, ply),
-                bound,
+                best_score,
+                tt_bound,
                 hash_move,
             )
             _TT_AGE[index] = _TT_GENERATION
@@ -950,7 +982,7 @@ class _Searcher:
 
     def _opponent_has_mate_in_one(self) -> bool:
         for reply in self.board.legal_moves:
-            if not self.board.gives_check(reply):
+            if not _gives_check(self.board, reply):
                 continue
             self.board.push(reply)
             try:
@@ -984,13 +1016,33 @@ class _Searcher:
                 best_move = move
         return best_move
 
+    def _selective_fallback(self, legal_moves: list[chess.Move]) -> chess.Move:
+        """Find a mate-safe emergency move without spending the search budget."""
+        for move in legal_moves:
+            self.board.push(move)
+            try:
+                if self.board.is_checkmate():
+                    return move
+            finally:
+                self.board.pop()
+
+        for move in legal_moves:
+            self.board.push(move)
+            try:
+                safe = not self._opponent_has_mate_in_one()
+            finally:
+                self.board.pop()
+            if safe:
+                return move
+        return legal_moves[0]
+
     def choose_move(self) -> chess.Move:
         legal_moves = list(self.board.legal_moves)
         if len(legal_moves) == 1:
             self.completed_depth = 0
             return legal_moves[0]
         if self.selective:
-            fallback = self._fallback_move(legal_moves)
+            fallback = self._selective_fallback(legal_moves)
             score = 0
             depth = 1
             while self._elapsed_ms() <= self.soft_budget_ms:
@@ -1000,7 +1052,7 @@ class _Searcher:
                     beta = score + window
                     self.iteration_root_moves_completed = 0
                     score = self._search_selective(depth, alpha, beta, 0, False)
-                    if self._elapsed_ms() >= self.hard_budget_ms:
+                    if self._elapsed_ms() > self.hard_budget_ms:
                         break
                     if alpha < score < beta:
                         self.completed_depth = depth
